@@ -190,7 +190,7 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 		InventoryProvider: func(ctx context.Context) (proto.InventoryData, error) {
 			return proto.InventoryData{}, nil
 		},
-		Handlers: LightHandlers(solarbeamMgr, updater, tray),
+		Handlers: LightHandlers(solarbeamMgr, updater, tray, wizardPrompter{}),
 	})
 
 	// The tray icon polls client.Stats()/solarbeamMgr.Status() and drives

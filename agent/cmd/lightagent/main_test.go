@@ -27,7 +27,7 @@ func TestLightHandlers_ExactCommandSet(t *testing.T) {
 	manager := solarbeam.New(solarbeam.Paths{})
 	updater := update.New(update.Config{})
 
-	handlers := LightHandlers(manager, updater, fakeNotifier{})
+	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakePrompter{})
 
 	want := []proto.CommandKind{
 		proto.CmdInventoryRefresh,
@@ -53,7 +53,7 @@ func TestLightHandlers_ExactCommandSet(t *testing.T) {
 func TestLightHandlers_NeverIncludesManagedOnlyKinds(t *testing.T) {
 	manager := solarbeam.New(solarbeam.Paths{})
 	updater := update.New(update.Config{})
-	handlers := LightHandlers(manager, updater, fakeNotifier{})
+	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakePrompter{})
 
 	// Wire values, not the proto.Cmd* constants. What must never be handled
 	// is the value that arrives on the wire: a constant renamed or removed
@@ -92,3 +92,12 @@ func handlerKinds(handlers map[proto.CommandKind]runtime.Handler) []string {
 	sort.Strings(out)
 	return out
 }
+
+// fakePrompter stands in for the connection-request dialog: the real one
+// blocks on a human and needs a window.
+type fakePrompter struct {
+	called bool
+	answer bool
+}
+
+func (f *fakePrompter) Prompt(string, string) bool { f.called = true; return f.answer }

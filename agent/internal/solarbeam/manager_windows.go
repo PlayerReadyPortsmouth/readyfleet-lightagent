@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -332,6 +333,27 @@ func waitForListener(addr string, timeout time.Duration) error {
 // launchBridge starts the bridge process with the per-session context in
 // its environment. The bridge presents BundleToken to ReadyApp's
 // /venue/bundle to fetch its engine + publisher tokens; the agent never
+// newHiddenCmd builds an exec.Cmd for a ReadyFleet-shipped child binary with
+// CREATE_NO_WINDOW set. Both the engine and the bridge are console-subsystem
+// binaries (built without -H=windowsgui), and this agent is itself
+// GUI-subsystem with no console of its own for a child to inherit — so
+// without this, Windows allocates each one a brand new, visible console
+// window on every session start. Regression test:
+// TestNewHiddenCmd_SuppressesConsoleWindow.
+//
+// A seam rather than setting SysProcAttr inline at each call site, so the
+// property is asserted directly on the constructed *exec.Cmd instead of by
+// spawning a real process and inferring it from window/console state after
+// the fact — the same "injectable function seam, never spawn a real process
+// in a test" convention this repo already uses everywhere else (see
+// ReadyFleet's CLAUDE.md). Same idiom exec/screencap_windows.go already uses
+// for its own child process, via the raw CreateProcess flag directly.
+func newHiddenCmd(path string) *exec.Cmd {
+	cmd := exec.Command(path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd
+}
+
 // holds those tokens. The bridge stays agent-launched in session 0
 // (networking only); it persists across the service's per-session engine
 // relaunches.
@@ -341,7 +363,7 @@ func (m *Manager) launchBridge(args proto.SolarbeamStartArgs) error {
 	}
 	// Clear a stale bridge from a prior session so it can rebind bridgeWSAddr.
 	terminateByName(filepath.Base(m.paths.Bridge))
-	cmd := exec.Command(m.paths.Bridge)
+	cmd := newHiddenCmd(m.paths.Bridge)
 	cmd.Env = append(os.Environ(),
 		"READYAPP_URL="+args.ReadyappURL,
 		"SESSION_ID="+args.SessionID,
@@ -392,16 +414,52 @@ func (m *Manager) prepareEngineInteractive() error {
 // restart-for-a-fresh-session semantics. The bridge.env file the service
 // reads doesn't apply here — the env vars go straight into the child
 // process's own environment instead.
+// buildEngineCmd constructs (without starting) the interactive engine
+// process. A pure function, factored out of startEngineInteractive purely so
+// cmd.Dir can be asserted directly in a test — see
+// TestBuildEngineCmd_RunsFromItsOwnDirectory — rather than inferred from a
+// spawned process's behaviour, which for a config-relative-path bug like this
+// one is exactly the kind of thing that "worked" by accident before and
+// could again.
+func buildEngineCmd(enginePath string, args proto.SolarbeamStartArgs) *exec.Cmd {
+	cmd := newHiddenCmd(enginePath)
+	// The engine resolves its own asset paths (assets/apps.json etc.)
+	// relative to its working directory, not relative to its own binary
+	// location — a Start Menu shortcut normally sets "Start in" to the
+	// install dir, which is what makes that assumption invisible. Without
+	// this the child inherits the AGENT's cwd instead, and the engine fails
+	// during config setup with "cannot copy file: No such file or
+	// directory" for a file that is genuinely sitting right next to it — it
+	// just never looked there. Caught live on 2026-08-18 via engine.log
+	// (added the same day this bug was found), on a real BYOD test session
+	// that never got past "waiting for the screen".
+	cmd.Dir = filepath.Dir(enginePath)
+	cmd.Env = append(os.Environ(),
+		"SOLARBEAM_BRIDGE_WS="+bridgeWSURL,
+		"SOLARBEAM_MACHINE_ID="+args.MachineID,
+	)
+	return cmd
+}
+
 func (m *Manager) startEngineInteractive(args proto.SolarbeamStartArgs) error {
 	if m.interactiveEngineProc != nil {
 		_ = m.interactiveEngineProc.Kill()
 		m.interactiveEngineProc = nil
 	}
-	cmd := exec.Command(m.paths.Engine)
-	cmd.Env = append(os.Environ(),
-		"SOLARBEAM_BRIDGE_WS="+bridgeWSURL,
-		"SOLARBEAM_MACHINE_ID="+args.MachineID,
-	)
+	cmd := buildEngineCmd(m.paths.Engine, args)
+	// Best-effort stdout/stderr capture to engine.log, mirroring
+	// launchBridge's bridge.log. Hiding the console window above means a
+	// crash or startup failure would otherwise leave NO trace anywhere —
+	// the only place the engine's own diagnostics went was the console
+	// window this same change just suppressed.
+	if err := os.MkdirAll(childLogDirInteractive(), 0o755); err == nil {
+		if logf, ferr := os.OpenFile(filepath.Join(childLogDirInteractive(), "engine.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+			cmd.Stdout = logf
+			cmd.Stderr = logf
+			defer logf.Close()
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start engine: %w", err)
 	}

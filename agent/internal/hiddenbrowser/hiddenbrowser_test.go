@@ -79,7 +79,7 @@ func (f *fakeWebView) Bind(name string, fn interface{}) error   { return nil }
 func newTestLauncher(notify *fakeNotifier, fake *fakeWebView) *Launcher {
 	return &Launcher{
 		notify:       notify,
-		newWebViewFn: func(profileDir, url string) (webview2.WebView, error) { return fake, nil },
+		newWebViewFn: func(profileDir, url, iconPath string) (webview2.WebView, error) { return fake, nil },
 		excludeFn:    func(uintptr) error { return nil },
 		foregroundFn: func(uintptr) {},
 		runFn:        func(wv webview2.WebView) { wv.Run() },
@@ -113,7 +113,7 @@ func TestOpen_FocusesExistingWindow(t *testing.T) {
 	notify := &fakeNotifier{}
 	fake := newFakeWebView()
 	l := &Launcher{notify: notify, wv: fake}
-	l.newWebViewFn = func(profileDir, url string) (webview2.WebView, error) {
+	l.newWebViewFn = func(profileDir, url, iconPath string) (webview2.WebView, error) {
 		t.Fatal("newWebViewFn must not be called when a window is already open")
 		return nil, nil
 	}
@@ -132,7 +132,7 @@ func TestOpen_FocusesExistingWindow(t *testing.T) {
 func TestOpen_CreationFails(t *testing.T) {
 	notify := &fakeNotifier{}
 	l := &Launcher{notify: notify}
-	l.newWebViewFn = func(profileDir, url string) (webview2.WebView, error) { return nil, errCreateFailed }
+	l.newWebViewFn = func(profileDir, url, iconPath string) (webview2.WebView, error) { return nil, errCreateFailed }
 	l.excludeFn = func(hwnd uintptr) error {
 		t.Fatal("excludeFn must not be called when creation fails")
 		return nil
@@ -183,7 +183,7 @@ func TestOpen_SerializesAgainstDoubleClick(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	fake := newFakeWebView()
-	l.newWebViewFn = func(profileDir, url string) (webview2.WebView, error) {
+	l.newWebViewFn = func(profileDir, url, iconPath string) (webview2.WebView, error) {
 		atomic.AddInt32(&createCalls, 1)
 		close(entered)
 		<-release
@@ -224,7 +224,7 @@ func TestOpen_ReopensAfterClose(t *testing.T) {
 	fake2 := newFakeWebView()
 	l := newTestLauncher(notify, fake1)
 	var createCalls int32
-	l.newWebViewFn = func(profileDir, url string) (webview2.WebView, error) {
+	l.newWebViewFn = func(profileDir, url, iconPath string) (webview2.WebView, error) {
 		if atomic.AddInt32(&createCalls, 1) == 1 {
 			return fake1, nil
 		}
@@ -271,4 +271,31 @@ func TestOpen_ReopensAfterClose(t *testing.T) {
 	}
 
 	fake2.Terminate()
+}
+
+// Aurora asked for the tray icon and this window to show the same logo
+// (18 Aug 2026). WebView2's own default falls back to a numeric resource ID
+// goversioninfo assigns internally and doesn't expose as a stable constant —
+// too fragile to depend on — so Launcher instead carries the exact .ico path
+// cmd/lightagent already staged for the tray, and passes it into window
+// creation to be set explicitly via WM_SETICON. This asserts that plumbing:
+// the path given to NewLauncher is the exact path newWebViewFn receives.
+func TestOpen_PassesTheTrayIconPathToTheWebView(t *testing.T) {
+	notify := &fakeNotifier{}
+	fake := newFakeWebView()
+	l := newTestLauncher(notify, fake)
+	l.iconPath = `C:\Users\test\AppData\Local\ReadyFleet Light\tray-connected.ico`
+
+	var gotIconPath string
+	l.newWebViewFn = func(profileDir, url, iconPath string) (webview2.WebView, error) {
+		gotIconPath = iconPath
+		return fake, nil
+	}
+
+	if err := l.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if gotIconPath != l.iconPath {
+		t.Errorf("newWebViewFn got iconPath %q, want %q", gotIconPath, l.iconPath)
+	}
 }

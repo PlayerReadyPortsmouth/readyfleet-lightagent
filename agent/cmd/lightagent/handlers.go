@@ -30,7 +30,7 @@ type notifier interface {
 // enforcement seam Task 4's design relies on: there is no handler for any
 // other kind because this binary never compiles one in, not because
 // something filters requests at runtime.
-func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier) map[proto.CommandKind]runtime.Handler {
+func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier, prompt prompter) map[proto.CommandKind]runtime.Handler {
 	return map[proto.CommandKind]runtime.Handler{
 		proto.CmdInventoryRefresh: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
 			runInventoryRefresh(ctx, env, send, manager)
@@ -48,7 +48,7 @@ func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify n
 			runSelfUpdate(ctx, env, send, updater)
 		},
 		proto.CmdShowNotification: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
-			runShowNotification(ctx, env, send, notify)
+			runShowNotification(ctx, env, send, notify, prompt)
 		},
 	}
 }
@@ -141,7 +141,7 @@ func severityFromWire(s string) trayicon.NotifySeverity {
 	}
 }
 
-func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, notify notifier) {
+func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, notify notifier, prompt prompter) {
 	start := time.Now()
 	var args proto.ShowNotificationArgs
 	if err := decodeArgs(cmdEnv, &args, proto.CmdShowNotification); err != nil {
@@ -154,6 +154,15 @@ func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transp
 		}, start)
 		return
 	}
+	// A connection request is a question the mentor has to answer, so it gets
+	// a dialog that waits for them rather than a balloon that fades. Every
+	// other kind stays a balloon: they are notices, not questions.
+	if args.Kind == connectionRequestKind && prompt != nil {
+		showConnectionRequest(prompt, args.Title, args.Body, args.URL)
+		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: 0, Duration: time.Since(start)}, start)
+		return
+	}
+
 	var onClick func()
 	if args.URL != "" {
 		url := args.URL // capture: args is this call's own local, but be explicit

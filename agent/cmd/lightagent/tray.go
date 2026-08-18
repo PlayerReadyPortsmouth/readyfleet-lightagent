@@ -46,7 +46,11 @@ func newLightTray() (tray *trayicon.Tray, connectedIconPath, offlineIconPath str
 // its caller. tray must be one built by newLightTray, not yet run.
 func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, offlineIconPath string, client *transport.Client, solarbeamMgr *solarbeam.Manager) {
 	var paused atomic.Bool
-	launcher := hiddenbrowser.NewLauncher(tray, filepath.Join(lightAppDataDir(), "hidden-readyapp-profile"))
+	launcher := hiddenbrowser.NewLauncher(
+		tray,
+		filepath.Join(lightAppDataDir(), "hidden-readyapp-profile"),
+		connectedIconPath, // same staged .ico the tray itself uses — see hiddenbrowser.Launcher's doc comment
+	)
 
 	menuItems := func() []trayicon.MenuItem {
 		toggleLabel := "Disconnect"

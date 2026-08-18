@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+    version="1.0.0.0"
+    processorArchitecture="*"
+    name="PlayerReady.ReadyFleet.LightAgent"
+    type="win32"
+  />
+  <description>ReadyFleet Light Agent</description>
+  <!--
+    ComCtl32 v6 dependency: without this, Windows silently loads the ancient
+    v5 common controls DLL, which does not implement TaskDialogIndirect at
+    all. The agent draws a connection-request prompt through
+    agent/internal/installerui, so without this the prompt fails to create
+    and the mentor is never asked — the agent appears to work while silently
+    dropping the one interaction it exists to surface.
+
+    This was a real failure, not a hypothetical: the BYOD installer shipped
+    without it on 18 Aug 2026 and did exactly that.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <!--
+    asInvoker, never requireAdministrator. The light agent runs as the signed-in
+    mentor on their own personal machine and has no elevated capability by
+    design; asking for elevation would both break the promise the installer
+    makes and fail silently at logon, where no one is there to answer a UAC
+    prompt.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <!-- Per-monitor DPI: the prompt is drawn on whatever display the mentor is
+       using, and a blurry consent dialog reads as untrustworthy. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2</dpiAwareness>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10/11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>

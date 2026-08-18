@@ -48,10 +48,38 @@ So the guarantee is this instead:
   declarations differ, and removing them is what stops this repository
   disclosing capabilities aimed at machines that are not yours.
 - **The capability boundary is testable.** `go test ./agent/... ./proto/...` runs the same checks we do.
-- **The file you were given is the file we published.** Compare its SHA-256 to
-  the hash published alongside the release, and check its Authenticode
-  signature against our published signer fingerprint. That proves the download
-  was not tampered with in transit.
+- **The file you were given is the file we published.** The download endpoint
+  returns both values as response headers — not just a claim, a value you can
+  fetch and diff yourself:
+
+      curl -sI https://readyapp.player-ready.co.uk/releases/agent-download/windows-byod-agent/<versionCode>
+
+  gives `x-artifact-sha256` and `x-artifact-signer-fingerprint`. Hash the file you were
+  given and compare; open its Properties → Digital Signatures in Windows
+  Explorer and confirm the signer thumbprint matches. Either mismatching means
+  the download was tampered with in transit — stop and don't run it.
+
+## A known gap in the pruning
+
+Six commands is the real surface (above) — but `proto/messages.go` here also
+declares several managed-fleet DATA shapes (`HardwareInfo`, `DiskInfo`,
+`NetworkInfo`, `TelemetryData`, `GPUInfo`, `ThermalInfo`) that this agent never
+populates. Not a leaked capability — the forbidden-symbol check that generates
+this repository would refuse to publish one of those — but worth being
+straight about rather than leaving unexplained.
+
+Why they're here: this agent and the managed one share a config struct
+(`internal/runtime.Config`), and that struct declares hooks for both. This
+agent's own inventory hook is a permanent stub:
+
+    InventoryProvider: func(ctx context.Context) (proto.InventoryData, error) {
+        return proto.InventoryData{}, nil
+    },
+
+— see `cmd/lightagent/main.go` — and never sets the telemetry hook at all. The
+struct field's TYPE still has to be declared for the shared code to compile,
+which is what pulls the shape declarations in. No instance of this agent has
+ever sent one populated.
 
 ## How it runs
 

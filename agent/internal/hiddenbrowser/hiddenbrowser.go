@@ -59,11 +59,18 @@ type notifier interface {
 type Launcher struct {
 	notify     notifier
 	profileDir string
+	// iconPath is the tray's own connected-state .ico, staged to disk by
+	// cmd/lightagent's writeTrayIcons before this Launcher is built. Setting
+	// the window icon FROM that file — rather than leaving WebView2 to fall
+	// back to whatever the .exe's own default resource resolves to — is what
+	// makes this window and the tray icon provably the same bytes, not just
+	// visually similar branding that could drift apart over time.
+	iconPath string
 
 	mu sync.Mutex
 	wv webview2.WebView // non-nil while the window is open; cleared when it closes
 
-	newWebViewFn func(profileDir, url string) (webview2.WebView, error)
+	newWebViewFn func(profileDir, url, iconPath string) (webview2.WebView, error)
 	excludeFn    func(hwnd uintptr) error
 	foregroundFn func(hwnd uintptr)
 	runFn        func(wv webview2.WebView)
@@ -76,8 +83,8 @@ type Launcher struct {
 // lightAppDataDir() in package main. notify is used to surface every
 // failure as a tray balloon; see Open's doc comment for which message
 // means what.
-func NewLauncher(notify notifier, profileDir string) *Launcher {
-	l := &Launcher{notify: notify, profileDir: profileDir}
+func NewLauncher(notify notifier, profileDir, iconPath string) *Launcher {
+	l := &Launcher{notify: notify, profileDir: profileDir, iconPath: iconPath}
 	l.newWebViewFn = newRealWebView
 	l.excludeFn = excludeFromCapture
 	l.foregroundFn = foregroundWindow
@@ -131,7 +138,7 @@ func (l *Launcher) Open() error {
 		// runtime.LockOSThread's docs).
 		runtime.LockOSThread()
 
-		wv, err := l.newWebViewFn(l.profileDir, readyAppURL())
+		wv, err := l.newWebViewFn(l.profileDir, readyAppURL(), l.iconPath)
 		resultCh <- createResult{wv, err}
 		if err != nil {
 			return
