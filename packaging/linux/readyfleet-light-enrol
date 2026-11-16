@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if (( EUID == 0 )); then
+  echo 'Run as the logged-in desktop user, without sudo.' >&2
+  exit 2
+fi
+if [[ $# != 1 || ! -f $1 ]]; then
+  echo 'usage: readyfleet-light-enrol /path/to/enrollment.json' >&2
+  exit 2
+fi
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+fi
+case ${ID:-} in
+  ubuntu) setup=setup-ubuntu.sh ;;
+  arch|cachyos) setup=setup-cachyos.sh ;;
+  *) echo 'Supported distributions: Ubuntu, CachyOS and Arch.' >&2; exit 2 ;;
+esac
+exec "/usr/lib/readyfleet-light/$setup" "$(realpath "$1")"

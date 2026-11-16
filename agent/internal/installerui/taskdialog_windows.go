@@ -30,7 +30,80 @@ import (
 var (
 	modcomctl32            = windows.NewLazySystemDLL("comctl32.dll")
 	procTaskDialogIndirect = modcomctl32.NewProc("TaskDialogIndirect")
+
+	modkernel32          = windows.NewLazySystemDLL("kernel32.dll")
+	procCreateActCtxW    = modkernel32.NewProc("CreateActCtxW")
+	procActivateActCtx   = modkernel32.NewProc("ActivateActCtx")
+	procDeactivateActCtx = modkernel32.NewProc("DeactivateActCtx")
+	procGetModuleHandleW = modkernel32.NewProc("GetModuleHandleW")
 )
+
+// actCtxW mirrors ACTCTXW (winbase.h) field-for-field so Go's natural
+// struct layout on amd64 matches the C ABI exactly — no packing pragma is
+// needed there, unlike taskDialogConfig below.
+type actCtxW struct {
+	cbSize                 uint32
+	dwFlags                uint32
+	lpSource               *uint16
+	wProcessorArchitecture uint16
+	wLangId                uint16
+	lpAssemblyDirectory    *uint16
+	lpResourceName         uintptr // MAKEINTRESOURCE(1) here, not a string pointer
+	lpApplicationName      *uint16
+	hModule                uintptr
+}
+
+const (
+	actctxFlagResourceNameValid     = 0x008
+	actctxFlagHmoduleValid          = 0x080
+	createprocessManifestResourceID = 1
+	invalidHandleValue              = ^uintptr(0)
+)
+
+// activateManifestContext pushes this process's own embedded ComCtl32 v6
+// manifest resource onto the CALLING THREAD's activation-context stack.
+//
+// Embedding the manifest (installer.manifest, linked via the package's
+// resource_windows_amd64.syso) is not sufficient by itself: Windows builds
+// a "process default" activation context from it at startup, but only
+// automatically applies that context to the process's original thread.
+// runTaskDialog's dialog goroutine calls runtime.LockOSThread(), which
+// pins it to *an* OS thread — but Go's scheduler hands it whichever OS
+// thread was available, almost always one the runtime created after
+// startup, not the original thread. That thread's activation stack starts
+// empty, so the dynamic comctl32.dll load in NewLazySystemDLL resolves
+// against the legacy v5 DLL (no manifest redirection applies) and
+// TaskDialogIndirect is reported missing — intermittently, since which
+// thread a goroutine lands on isn't deterministic. Explicitly activating
+// the context on whatever thread we're actually running on removes that
+// dependency on scheduling luck. Best-effort: on any failure here, the
+// caller proceeds with the syscall anyway rather than silently changing
+// behaviour if this ever needs to be diagnosed itself.
+func activateManifestContext() (deactivate func(), err error) {
+	hmod, _, callErr := procGetModuleHandleW.Call(0)
+	if hmod == 0 {
+		return nil, fmt.Errorf("GetModuleHandleW: %w", callErr)
+	}
+	ctx := actCtxW{
+		dwFlags:        actctxFlagHmoduleValid | actctxFlagResourceNameValid,
+		lpResourceName: createprocessManifestResourceID,
+		hModule:        hmod,
+	}
+	ctx.cbSize = uint32(unsafe.Sizeof(ctx))
+
+	h, _, callErr := procCreateActCtxW.Call(uintptr(unsafe.Pointer(&ctx)))
+	if h == invalidHandleValue {
+		return nil, fmt.Errorf("CreateActCtxW: %w", callErr)
+	}
+	var cookie uintptr
+	ret, _, callErr := procActivateActCtx.Call(h, uintptr(unsafe.Pointer(&cookie)))
+	if ret == 0 {
+		return nil, fmt.Errorf("ActivateActCtx: %w", callErr)
+	}
+	return func() {
+		procDeactivateActCtx.Call(0, cookie)
+	}, nil
+}
 
 // Native TASKDIALOGCONFIG flags/constants (commctrl.h). Deliberately not
 // declared as Go constants with descriptive names beyond what's used —
@@ -283,6 +356,9 @@ func runTaskDialog(cfg *taskDialogConfig, onCreated func(hwnd uintptr)) (buttonI
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+		if deactivate, actErr := activateManifestContext(); actErr == nil {
+			defer deactivate()
+		}
 		buf := cfg.marshal()
 		var pnButton int32
 		ret, _, callErr := procTaskDialogIndirect.Call(

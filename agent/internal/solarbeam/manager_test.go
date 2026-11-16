@@ -1,8 +1,10 @@
 package solarbeam
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -87,6 +89,7 @@ func TestStart_PrepareFailureSkipsLaunch(t *testing.T) {
 
 func TestStop_StopsAndReportsSuccess(t *testing.T) {
 	m := New(Paths{})
+	startBoundSession(t, m, "sess-1")
 	stopped := false
 	m.stopFn = func() error { stopped = true; return nil }
 
@@ -100,6 +103,7 @@ func TestStop_StopsAndReportsSuccess(t *testing.T) {
 
 func TestStop_FailureReportedWithStopPrefix(t *testing.T) {
 	m := New(Paths{})
+	startBoundSession(t, m, "sess-1")
 	m.stopFn = func() error { return errors.New("SunshineService stop failed") }
 
 	err := m.Stop(context.Background(), proto.StopSolarbeamArgs{SessionID: "sess-1"})
@@ -167,5 +171,48 @@ func TestNew_ModeInteractive_WiresNoServiceSeams(t *testing.T) {
 	}
 	if reflect.ValueOf(m.statusFn).Pointer() != reflect.ValueOf(m.engineProcessRunning).Pointer() {
 		t.Error("ModeInteractive must wire engineProcessRunning, which never touches the SCM")
+	}
+}
+
+func TestStart_LogsDispatchReceivedAndComplete(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	m := New(Paths{})
+	m.prepareFn = func() error { return nil }
+	m.launchFn = func(proto.SolarbeamStartArgs) error { return nil }
+	m.engineFn = func(proto.SolarbeamStartArgs) error { return nil }
+
+	args := proto.SolarbeamStartArgs{SessionID: "sess-1", MachineID: "uuid-1", BundleToken: "btok"}
+	if err := m.Start(context.Background(), args); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "phase=start_received") || !strings.Contains(out, "session_id=sess-1") {
+		t.Fatalf("log output missing start_received phase with session_id: %s", out)
+	}
+	if !strings.Contains(out, "phase=start_complete") {
+		t.Fatalf("log output missing start_complete phase: %s", out)
+	}
+}
+
+func TestStart_LaunchFailureDoesNotLogComplete(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	m := New(Paths{})
+	m.prepareFn = func() error { return nil }
+	m.launchFn = func(proto.SolarbeamStartArgs) error { return errBridgeLaunch }
+	m.engineFn = func(proto.SolarbeamStartArgs) error { return nil }
+
+	_ = m.Start(context.Background(), proto.SolarbeamStartArgs{SessionID: "s", MachineID: "m", BundleToken: "b"})
+
+	if strings.Contains(buf.String(), "phase=start_complete") {
+		t.Fatal("start_complete must not be logged when the bridge launch fails")
 	}
 }

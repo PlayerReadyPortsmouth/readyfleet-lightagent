@@ -57,6 +57,36 @@ func (w Wizard) ShowWelcome(mainInstruction, content string, bullets []string, c
 	return buttonID == idContinue
 }
 
+// ShowConfirm displays a plain Continue/Cancel confirmation screen — no
+// bullet list, no expandable section, no footer. Used for the
+// reinstall-on-an-already-enrolled-machine prompt: the default button is
+// Cancel, not Continue, since this is a step up in consequence from the
+// welcome screen (it stops the running service and replaces the machine's
+// enrollment) and an operator hitting Enter without reading should get the
+// safe outcome. Returns true only if the user clicked Continue.
+func (w Wizard) ShowConfirm(mainInstruction, content string) bool {
+	buttons := []taskDialogButton{
+		{nButtonID: idContinue, pszButtonText: utf16OrNil("Continue")},
+		{nButtonID: idCancel, pszButtonText: utf16OrNil("Cancel")},
+	}
+	packedButtons := packTaskDialogButtons(buttons)
+	cfg := &taskDialogConfig{
+		dwFlags:            tdfAllowDialogCancellation | tdfSizeToContent,
+		pszWindowTitle:     utf16OrNil(w.Title),
+		mainIcon:           tdInformationIcon,
+		pszMainInstruction: utf16OrNil(mainInstruction),
+		pszContent:         utf16OrNil(content),
+		cButtons:           uint32(len(buttons)),
+		pButtons:           uintptr(unsafe.Pointer(&packedButtons[0])),
+		nDefaultButton:     idCancel,
+	}
+	buttonID, err := runTaskDialog(cfg, nil)
+	if err != nil {
+		return false
+	}
+	return buttonID == idContinue
+}
+
 // RunWithProgress shows a live progress screen while run executes on a
 // background goroutine, then closes automatically the instant run
 // returns — the dialog never waits for a click of its own. totalSteps is

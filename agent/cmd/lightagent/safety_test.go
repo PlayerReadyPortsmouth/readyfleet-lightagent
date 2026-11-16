@@ -70,7 +70,7 @@ func TestLightagentBinary_ContainsNoForbiddenStrings(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "lightagent-safety-check.bin")
 
-	cmd := exec.Command("go", "build", "-o", out, ".")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, ".")
 	cmd.Dir = "."
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -108,7 +108,7 @@ func TestLightagentBinary_ContainsNoForbiddenStrings(t *testing.T) {
 // the binary (e.g. it's dead-code-eliminated but still technically
 // imported, which `go list` sees and a strings scan wouldn't).
 func TestLightagentBinary_ImportBoundary(t *testing.T) {
-	cmd := exec.Command("go", "list", "-f", "{{join .Deps \"\\n\"}}", ".")
+	cmd := exec.Command("go", "list", "-buildvcs=false", "-f", "{{join .Deps \"\\n\"}}", ".")
 	cmd.Dir = "."
 	out, err := cmd.Output()
 	if err != nil {

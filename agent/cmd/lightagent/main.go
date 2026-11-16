@@ -37,10 +37,12 @@ import (
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinventory"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/runtime"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/sacposture"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/sessionindicator"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
 	svcpkg "github.com/playerreadyportsmouth/readyfleet/agent/internal/svc"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/update"
-	"github.com/playerreadyportsmouth/readyfleet/proto"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/venuepolicy"
 )
 
 // lightProductID and lightProfile identify this entrypoint's own releases
@@ -57,6 +59,15 @@ const (
 )
 
 var lightTrustedSigners = map[string]struct{}{lightTrustedSigner: {}}
+
+// protectKeyACLFn locks a freshly written light-agent private key down to
+// the current Windows user only. Defaults to lightinstall.ProtectKeyACL;
+// tests swap it so they never touch real Windows ACLs, matching this
+// codebase's injectable-seam convention (see agent/CLAUDE.md). runLightEnrollment
+// is the direct-run re-enrolment path — unlike lightinstall.Manager.Install,
+// which already calls this via its own protectKeyFn seam, this path
+// previously left a fresh key at only default inherited NTFS permissions.
+var protectKeyACLFn = lightinstall.ProtectKeyACL
 
 func main() {
 	if len(os.Args) > 1 {
@@ -128,9 +139,22 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 		}
 	}
 
-	solarbeamMgr := solarbeam.New(solarbeam.Paths{
-		Engine: solarbeamPath("SOLARBEAM_ENGINE_PATH", lightEnginePath()),
-		Bridge: solarbeamPath("SOLARBEAM_BRIDGE_PATH", lightBridgePath()),
+	trustedPublicKeys, err := platformTrustedPublicKeys()
+	if err != nil {
+		return fmt.Errorf("load Linux release trust: %w", err)
+	}
+	trustedSigners := make(map[string]struct{}, len(lightTrustedSigners)+len(trustedPublicKeys))
+	for fingerprint := range lightTrustedSigners {
+		trustedSigners[fingerprint] = struct{}{}
+	}
+	for fingerprint := range trustedPublicKeys {
+		trustedSigners[fingerprint] = struct{}{}
+	}
+
+	solarbeamMgr := solarbeam.New(platformSolarbeamPaths(cfg, solarbeam.Paths{
+		StateDir: filepath.Dir(configPath),
+		Engine:   solarbeamPath("SOLARBEAM_ENGINE_PATH", lightEnginePath()),
+		Bridge:   solarbeamPath("SOLARBEAM_BRIDGE_PATH", lightBridgePath()),
 		// Root is set explicitly rather than left for Update to derive from
 		// filepath.Dir(Engine): the extraction target is the whole point of
 		// this profile differing from managed, so it is stated, not inferred.
@@ -141,15 +165,54 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 		// outright without admin rights, which the light agent
 		// deliberately never has. See the Mode type doc in
 		// internal/solarbeam/manager.go.
-		Mode: solarbeam.ModeInteractive,
-	})
+		Mode:              solarbeam.ModeInteractive,
+		TrustedPublicKeys: trustedPublicKeys,
+		LinkAuthMode:      cfg.SolarbeamLinkAuthMode,
+	}))
+	// Same leaf signer this entrypoint's own self-update trusts
+	// (lightTrustedSigner above) — CmdSolarbeamEngineUpdate is the one
+	// command that actually reaches solarbeam.Manager.Update, so this is
+	// the call site that matters: without it, Update would trust
+	// whatever hex-shaped signer_fingerprint the C2 sent. See
+	// solarbeam.Manager.TrustedSigners's doc comment.
+	solarbeamMgr.TrustedSigners = trustedSigners
+	if err := solarbeamMgr.ReconcileHosting(ctx); err != nil {
+		logger.Warn("solarbeam hosting refusal needs attention", "err", err)
+	}
+	// macOS only (no-op elsewhere): say at start whether this Mac can host,
+	// why not, and what it cannot do, so the answer is in the log before the
+	// first start_solarbeam arrives.
+	platformLogHostAvailability(logger, solarbeamMgr)
+	// Stop the per-session engine and clear the session once the bridge has
+	// exited (it now ends itself when the session does), so the update
+	// interlock below does not stay shut behind a finished session.
+	go solarbeamMgr.RunSessionReaper(ctx, solarbeam.DefaultReapInterval)
 
 	updater := update.New(update.Config{
-		AllowedHost: agentDownloadHost(cfg.ServerURL),
+		AllowedHost:              agentDownloadHost(cfg.ServerURL),
+		TrustedPublicKeys:        trustedPublicKeys,
+		RequireDetachedSignature: len(trustedPublicKeys) > 0,
+		TempPattern:              platformUpdateTempPattern(),
+		// Stage the download beside the binary it will replace, not in
+		// os.TempDir(). applyLightUpdate activates an update by renaming the
+		// downloaded file over the running binary, and a rename cannot cross
+		// filesystems: with /tmp a tmpfs and ~/.config on the root filesystem,
+		// every Linux self-update failed with
+		//
+		//	apply: activate agent update: rename /tmp/readyfleet-light-update-1571317206.bin
+		//	/home/ara/.config/readyfleet-light/readyfleet-light: invalid cross-device link
+		//
+		// It went unnoticed because no Linux BYOD machine had ever completed a
+		// self-update — the first release to be converged onto an installed
+		// Linux box is the one that found this. Staging in the destination
+		// directory is the pattern the rest of the agent already uses
+		// (bootstrap.install, nasagent, filebrowser all CreateTemp beside the
+		// target) and it makes the activation atomic as a side effect.
+		DownloadDir: updateStagingDir(),
 		Policy: update.ProductPolicy{
 			ProductID: lightProductID,
 			Profile:   lightProfile,
-			Signers:   lightTrustedSigners,
+			Signers:   trustedSigners,
 		},
 	})
 	updater.ApplyFn = applyLightUpdate
@@ -164,33 +227,88 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 		"machine_id", cfg.MachineID,
 	)
 
+	// Heal the startup registration if it has drifted from what this agent
+	// version expects. The unit is written by the installer and by nothing
+	// else, so without this a machine installed before the Linux
+	// capability/portal fix would keep its broken systemd unit through every
+	// self-update, forever. No-op off Linux, and never restarts the agent —
+	// see lightinstall.ReconcileStartupUnit.
+	if exePath, err := os.Executable(); err == nil {
+		if changed, err := lightinstall.ReconcileStartupUnit(exePath); err != nil {
+			logger.Warn("could not reconcile startup unit", "error", err)
+		} else if changed {
+			logger.Info("startup unit rewritten; it takes effect at the next agent restart")
+		}
+	}
+
+	// Same reason, same shape: the engine's capture-backend setting and its
+	// KWin screencast permission entry are written by the installer, so a
+	// machine installed before they existed would never get them. Both are
+	// idempotent, so this costs nothing on a machine that is already correct.
+	// No-op off Linux — see lightinstall.EnsureEngineEnvironment.
+	if err := lightinstall.EnsureEngineEnvironment(); err != nil {
+		logger.Warn("could not prepare the SolarBeam engine environment", "error", err)
+	}
+	helloInventory, err := lightinventory.Collect(ctx, agentVersion, solarbeamMgr)
+	if err != nil {
+		return fmt.Errorf("collect hello platform: %w", err)
+	}
+
 	// Built before the handler map (not inside runTrayIcon, its previous
 	// home) because CmdShowNotification's handler needs a live
 	// *trayicon.Tray to call Notify on — see newLightTray's doc comment.
 	tray, connectedIconPath, offlineIconPath := newLightTray()
 
+	// The on-screen "you are being viewed" bar. Off unless config.json
+	// says otherwise (config.SessionIndicatorEnabled), and nil when off —
+	// every call site treats nil as "no indicator on this machine". On
+	// Linux it is only safe to enable once an engine honouring
+	// capture_reserve_top has converged onto the machine; see the
+	// SessionIndicator field doc.
+	indicator := startSessionIndicator(
+		cfg.SessionIndicatorEnabled(), cfg.SessionIndicatorRequired(), solarbeamMgr, logger)
+	if indicator != nil {
+		// Tell the engine to keep the band out of its capture. Without
+		// this the bar would be streamed to the viewer.
+		if err := lightinstall.EnsureCaptureReserveTop(sessionindicator.ReserveHeight); err != nil {
+			logger.Error("session indicator: could not reserve the capture band in the engine config; the bar may be visible to the remote viewer",
+				"phase", "session_indicator_reserve_failed", "err", err)
+		}
+	}
+
+	// macOS only (nil elsewhere, and nil on a Mac with no helper bundle
+	// installed): the menu-bar item, drawn by "ReadyFleet Menu.app" over a
+	// loopback socket because this binary is CGO-free. Started before the
+	// handler map because the consent gate asks through it when
+	// menu_prompts is on. See menu_darwin.go.
+	menu := startMenuHelper(ctx, cfg, logger)
+
+	// The C2's venue policy for the current connection, reset on every
+	// reconnect and set from the authenticated hello_ack.
+	var remotePolicy venuepolicy.State
 	client := runtime.NewClient(runtime.Config{
-		ServerURL:    cfg.ServerURL,
-		CertFile:     cfg.CertPath,
-		KeyFile:      cfg.KeyPath,
-		CAFile:       cfg.CAPath,
-		MachineID:    cfg.MachineID,
-		AgentVersion: agentVersion,
-		Insecure:     insecure,
-		Logger:       logger,
-		// The light entrypoint never sends a full InventoryData snapshot —
-		// only LightInventoryData, via the CmdInventoryRefresh handler
-		// below (MsgInventory's payload is opaque JSON, not locked to any
-		// Go type, so this is legitimate). This callback exists only to
-		// satisfy transport.Config's hello-triggered auto-refresh hook; an
-		// empty snapshot leaks nothing since every field is zero-valued.
-		// The C2's BYOD ingestion path (strict LightInventoryData decode,
-		// Task 7) doesn't exist yet — this is a known, deliberate gap for
-		// this increment, not a real inventory pipeline.
-		InventoryProvider: func(ctx context.Context) (proto.InventoryData, error) {
-			return proto.InventoryData{}, nil
-		},
-		Handlers: LightHandlers(solarbeamMgr, updater, tray, wizardPrompter{}),
+		ServerURL:             cfg.ServerURL,
+		CertFile:              cfg.CertPath,
+		KeyFile:               cfg.KeyPath,
+		CAFile:                cfg.CAPath,
+		MachineID:             cfg.MachineID,
+		AgentVersion:          agentVersion,
+		OS:                    helloInventory.OSFamily,
+		OSVersion:             helloInventory.OSMajorVersion,
+		SACProbe:              sacposture.Probe,
+		Insecure:              insecure,
+		Logger:                logger,
+		InventoryProvider:     lightInventoryProvider(agentVersion, solarbeamMgr),
+		VenuePolicyObserver:   remotePolicy.Set,
+		ConsentDismissHandler: handleConsentDismiss,
+		Handlers: LightHandlers(
+			solarbeamMgr, updater,
+			newLightNotifier(tray, logger),
+			newConsentGate(cfg.OwnerActorID, &remotePolicy, menu.consentAsker(logger), logger),
+			indicator,
+			&remotePolicy,
+			cfg.OwnerActorID,
+		),
 	})
 
 	// The tray icon polls client.Stats()/solarbeamMgr.Status() and drives
@@ -200,7 +318,18 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 	// the real connection down with it, so this runs detached, own
 	// goroutine, own error handling (logged inside runTrayIcon, never
 	// propagated here).
-	go runTrayIcon(ctx, tray, connectedIconPath, offlineIconPath, client, solarbeamMgr)
+	go runTrayIcon(ctx, tray, connectedIconPath, offlineIconPath, client, solarbeamMgr, cfg.MachineID)
+
+	// Same detached posture as the tray, for the same reason: a bar that
+	// cannot be drawn must never take the agent's connection down with
+	// it. Run logs its own failures and never returns an error.
+	if indicator != nil {
+		go indicator.Run(ctx)
+	}
+
+	// And the menu-bar status, same posture again (no-op off macOS or
+	// without a helper).
+	go runMenuStatus(ctx, menu, client, solarbeamMgr, cfg)
 
 	return client.Run(ctx)
 }
@@ -242,11 +371,28 @@ func runLightEnrollment(ctx context.Context, configPath string, cfg *config.Conf
 
 	logger.Info("enrolled", "machine_id", res.MachineID)
 
+	// Lock the fresh private key down to this user before persisting
+	// anything that points at it — mirrors lightinstall.Manager.Install's
+	// protectKeyFn step (install.go), which aborts the whole install on
+	// failure rather than leaving a key at default NTFS permissions.
+	// This is the direct-run re-enrolment path (not through
+	// light-installer.exe), so nothing else in this process would ever
+	// call ProtectKeyACL on res.KeyPath otherwise.
+	if err := protectKeyACLFn(res.KeyPath); err != nil {
+		return fmt.Errorf("protect key: %w", err)
+	}
+
 	cfg.MachineID = res.MachineID
 	cfg.VenueID = res.VenueID
 	cfg.CertPath = res.CertPath
 	cfg.KeyPath = res.KeyPath
 	cfg.CAPath = res.CAPath
+	// Who this device answers to, for the consent gate. Assigned
+	// unconditionally: a re-enrolment that came back without an owner has
+	// genuinely lost the attribution, and keeping a stale one would let a
+	// device keep skipping prompts for someone the controller no longer
+	// says owns it.
+	cfg.OwnerActorID = res.OwnerActorID
 	if res.AgentListenURL != "" {
 		cfg.ServerURL = res.AgentListenURL
 	}
@@ -347,13 +493,7 @@ func defaultLightLogPath() string {
 // task" model (as opposed to the managed agent's %ProgramData% + LocalSystem
 // service).
 func lightAppDataDir() string {
-	base := os.Getenv("LocalAppData")
-	if base == "" {
-		// Dev / fakeagent fallback, mirroring config.DefaultPath()'s own
-		// non-Windows fallback convention.
-		return "lightagent-data"
-	}
-	return filepath.Join(base, "ReadyFleet Light")
+	return platformLightAppDataDir()
 }
 
 func stripSchemeAndPath(serverURL string) string {
@@ -403,17 +543,12 @@ func agentDownloadHost(serverURL string) string {
 // installer). ModeInteractive already launches it from wherever it lands —
 // see the Mode type doc in internal/solarbeam/manager.go.
 func lightEngineDir() string {
-	base := os.Getenv("LocalAppData")
-	if base == "" {
-		// Dev / fakeagent fallback, mirroring lightAppDataDir's.
-		return "solarbeam-engine"
-	}
-	return filepath.Join(base, "SolarBeam")
+	return platformLightEngineDir()
 }
 
-func lightEnginePath() string { return filepath.Join(lightEngineDir(), "sunshine.exe") }
+func lightEnginePath() string { return filepath.Join(lightEngineDir(), platformEngineBinary()) }
 
-func lightBridgePath() string { return filepath.Join(lightEngineDir(), "solarbeam-bridge.exe") }
+func lightBridgePath() string { return filepath.Join(lightEngineDir(), platformBridgeBinary()) }
 
 func solarbeamPath(key, def string) string {
 	if v := os.Getenv(key); v != "" {

@@ -69,20 +69,36 @@ func verifyBundledAgent(exePath string) error {
 	if got := hex.EncodeToString(h.Sum(nil)); got != expectedAgentSHA256 {
 		return fmt.Errorf("bundled agent sha256 mismatch: got %s want %s", got, expectedAgentSHA256)
 	}
-	if err := verify.VerifyAuthenticode(exePath, expectedSignerFingerprint); err != nil {
+	// A personal PC does not trust ReadyFleet's private signing root, and a
+	// BYOD install must never ask someone to add a root CA to their own
+	// machine. So accept exactly one extra case — a cryptographically valid
+	// signature whose chain ends in an untrusted root — and rely on the two
+	// pins for authority: the exact SHA-256 above and the signer certificate
+	// fingerprint inside VerifyAuthenticodeAllowUntrustedRoot. Same posture
+	// as the managed bootstrap installer (agent/internal/bootstrap). Before
+	// this, every Windows BYOD install failed here with "terminated in a root
+	// certificate which is not trusted" (reproduced on a clean Windows 11 VM,
+	// 24 Sep 2026).
+	if err := verify.VerifyAuthenticodeAllowUntrustedRoot(exePath, expectedSignerFingerprint); err != nil {
 		return fmt.Errorf("authenticode: %w", err)
 	}
 	return nil
 }
 
-// protectKeyACL restricts keyPath to the current user only, via
+// ProtectKeyACL restricts keyPath to the current user only, via
 // icacls.exe — the design doc's "current-user ACLs" alternative to DPAPI
 // (simpler: no CryptProtectData/CryptUnprotectData binding needed, and
 // the file stays a plain PEM readable by config.Load without an extra
 // decrypt step). Shelling to icacls.exe matches this codebase's existing
 // convention of shelling to system tools (sc.exe, msiexec.exe) rather
 // than binding Win32 APIs directly.
-func protectKeyACL(keyPath string) error {
+//
+// Exported so both writers of a light-agent private key can lock it down
+// the same way: the light-installer flow (via Manager.Install's
+// protectKeyFn seam, defaulted to this func below) and the direct-run
+// re-enrolment path in cmd/lightagent (runLightEnrollment), which writes
+// a fresh key via enroll.Enroll outside the installer entirely.
+func ProtectKeyACL(keyPath string) error {
 	u, err := user.Current()
 	if err != nil {
 		return fmt.Errorf("resolve current user: %w", err)
@@ -133,22 +149,34 @@ func removeLogonStartup() error {
 // material under cfg.Paths.Root. Mirrors agent/cmd/lightagent/main.go's
 // runLightEnrollment (which handles re-enrollment on an already-installed
 // machine); this is the first-install path.
-func enrollLight(ctx context.Context, cfg Config, payload Payload) error {
+func enrollLight(ctx context.Context, cfg Config, payload Payload, onPending func()) error {
+	// Adapted rather than passed straight through: enroll hands its
+	// callback the pending id and poll cadence, neither of which the
+	// installer's wizard has any use for, and nil must stay nil so a
+	// UI-less caller still fails fast instead of waiting.
+	var onPendingOpt func(enroll.Pending)
+	if onPending != nil {
+		onPendingOpt = func(enroll.Pending) { onPending() }
+	}
 	res, err := enroll.Enroll(ctx, enroll.Options{
 		EnrollmentURL: deriveEnrollmentURL(cfg.ServerURL),
 		BearerSecret:  payload.EnrollmentToken,
 		MaterialDir:   cfg.Paths.Root,
+		OnPending:     onPendingOpt,
+
+		ExpectInstallProfile: cfg.ExpectInstallProfile,
 	})
 	if err != nil {
 		return err
 	}
 	c := config.Config{
-		ServerURL: cfg.ServerURL,
-		MachineID: res.MachineID,
-		VenueID:   res.VenueID,
-		CertPath:  res.CertPath,
-		KeyPath:   res.KeyPath,
-		CAPath:    res.CAPath,
+		ServerURL:    cfg.ServerURL,
+		MachineID:    res.MachineID,
+		VenueID:      res.VenueID,
+		CertPath:     res.CertPath,
+		KeyPath:      res.KeyPath,
+		CAPath:       res.CAPath,
+		OwnerActorID: res.OwnerActorID,
 	}
 	if res.AgentListenURL != "" {
 		c.ServerURL = res.AgentListenURL

@@ -50,14 +50,14 @@ const certEUntrustedRoot = windows.Errno(0x800B0109)
 // any other status — except it additionally accepts the one specific case
 // where the signature and chain are cryptographically valid but the
 // private ReadyFleet root isn't in the machine's trust store yet. This is
-// for the managed bootstrap installer's fresh-venue-machine case only: a
-// brand new PC has no reason to already trust an internal CA it's never
-// seen, and the managed installer is the one place that first-contact
-// bootstrapping has to happen locally rather than being a precondition
-// (unlike BYOD, where the mentor explicitly imports the CA before this
-// ever runs — see docs/runbooks/byod-light-agent.md). Exact content and
-// signer fingerprint pinning apply identically either way; only the
-// trust-chain leniency differs.
+// for machines that have no reason to trust ReadyFleet's private root:
+// the managed bootstrap installer on a fresh venue PC, and every BYOD
+// (personal) PC — the BYOD installer's bundled agent and the light agent's
+// self-update. BYOD machines never import the CA (asking someone to add a
+// root CA to a personal PC is not acceptable, and in practice nobody did,
+// so every Windows BYOD install failed). Exact content and signer
+// fingerprint pinning apply identically either way; only the trust-chain
+// leniency differs.
 func VerifyAuthenticodeAllowUntrustedRoot(path, expectedFingerprint string) error {
 	return verifyAuthenticode(path, expectedFingerprint, true)
 }

@@ -7,6 +7,7 @@ listed here, there is no code in this binary that can act on it.
 | Command | Wire value |
 |---|---|
 | `CmdInventoryRefresh` | "inventory_refresh" |
+| `CmdSetSolarbeamAvailability` | "set_solarbeam_availability" |
 | `CmdShowNotification` | "show_notification" |
 | `CmdSolarbeamEngineUpdate` | "solarbeam_engine_update" |
 | `CmdStartSolarbeam` | "start_solarbeam" |
