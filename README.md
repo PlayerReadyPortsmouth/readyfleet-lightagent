@@ -34,10 +34,38 @@ server. Enrolment credentials are never part of a diagnostic report.
 
 ## Verify a download
 
-The published Windows agent download returns x-artifact-sha256 and
-x-artifact-signer-fingerprint headers. Compare the downloaded bytes' SHA-256
-and its Windows Digital Signatures signer with those values before running it.
-Linux release bundles are signed separately and verified by the downloader.
+The agent download returns x-artifact-sha256 and
+x-artifact-signer-fingerprint headers. For the Windows agent, replace
+<versionCode> with the published release code and run in PowerShell:
+
+    $url = 'https://readyapp.player-ready.co.uk/releases/agent-download/windows-byod-agent/<versionCode>'
+    $release = Invoke-WebRequest -Uri $url -OutFile .\lightagent.exe -PassThru
+    (Get-FileHash -LiteralPath .\lightagent.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $release.Headers['x-artifact-sha256']
+    $cert = (Get-AuthenticodeSignature -LiteralPath .\lightagent.exe).SignerCertificate
+    if ($null -eq $cert) { throw 'No Authenticode signer certificate' }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($sha256.ComputeHash($cert.RawData))).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+    $release.Headers['x-artifact-signer-fingerprint']
+
+Both pairs of hashes must match before running the file. The signer header is
+SHA-256 of the leaf certificate's DER bytes, not Windows' default SHA-1
+certificate thumbprint. These comparisons identify the published artifact;
+they do not add Windows trust for Ready's private signing root.
+
+For Linux, download the bundle from
+https://readyapp.player-ready.co.uk/releases/agent-download/linux-byod-bundle/<versionCode>
+and compare sha256sum of the file with its x-artifact-sha256 header. The
+bootstrap downloader checks that SHA-256; agent self-updates also verify the
+Ed25519 signature. The public release key is [linux-release-public.pem](linux-release-public.pem).
+Its raw 32-byte Ed25519 public-key SHA-256, also carried in the signer header, is:
+
+    5961b14ed61f81602d7a48e65884bd3f20e4bb9dde2e4a2a6cefb61a29800c0a
+
+When the release's detached signature is supplied as artifact.sig alongside
+artifact, verify it with:
+
+    openssl pkeyutl -verify -rawin -pubin -inkey linux-release-public.pem -sigfile artifact.sig -in artifact
 
 A mirror build uses pruned protocol source, so it does not reproduce the exact
 bytes of the private full-protocol release build. The import-boundary tests
