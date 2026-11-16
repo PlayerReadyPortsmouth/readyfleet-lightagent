@@ -233,6 +233,9 @@ type trayState struct {
 	// NIN_BALLOONHIDE/NIN_BALLOONTIMEOUT, so a stale handler from an
 	// already-dismissed notification can never fire late.
 	notifyClickHandler func()
+	onActivate         func()
+	badge              bool
+	iconPath           string
 }
 
 func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
@@ -246,7 +249,13 @@ func wndProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmTrayCallback:
 		switch lParam {
-		case wmLButtonUp, wmRButtonUp:
+		case wmLButtonUp:
+			if ts.onActivate != nil {
+				go ts.onActivate()
+			} else {
+				ts.showMenu()
+			}
+		case wmRButtonUp:
 			ts.showMenu()
 		case ninBalloonUserClick:
 			ts.mu.Lock()
@@ -532,6 +541,8 @@ type MenuItem struct {
 type Tray struct {
 	Tooltip  string
 	IconPath string
+	// OnActivate optionally replaces the left-click menu. Set before Run.
+	OnActivate func()
 
 	mu    sync.Mutex
 	state *trayState
@@ -566,7 +577,7 @@ func (t *Tray) Run(ctx context.Context, items []MenuItem) error {
 		}
 	}
 
-	ts := &trayState{hwnd: hwnd, hIcon: hIcon, ownsHIcon: ownsHIcon, items: items}
+	ts := &trayState{hwnd: hwnd, hIcon: hIcon, ownsHIcon: ownsHIcon, items: items, onActivate: t.OnActivate, iconPath: t.IconPath}
 	t.mu.Lock()
 	t.state = ts
 	t.mu.Unlock()
@@ -628,7 +639,11 @@ func (t *Tray) SetTooltip(s string) {
 	}
 	t.Tooltip = s
 	nid := ts.buildNID(s)
-	_ = shellNotifyIcon(nimModify, nid)
+	if err := shellNotifyIcon(nimModify, nid); err != nil {
+		// Explorer can restart without this message-only window receiving
+		// TaskbarCreated. The next status refresh restores the missing icon.
+		_ = shellNotifyIcon(nimAdd, nid)
+	}
 }
 
 // NotifySeverity selects a balloon notification's icon style.
@@ -716,18 +731,29 @@ func (t *Tray) SetIconPath(path string) error {
 		return err
 	}
 	ts.mu.Lock()
+	badge := ts.badge
+	ts.mu.Unlock()
+	if badge {
+		badged, err := addConnectionBadge(h)
+		if err != nil {
+			procDestroyIcon.Call(h)
+			return err
+		}
+		procDestroyIcon.Call(h)
+		h = badged
+	}
+	ts.mu.Lock()
+	ts.iconPath = path
 	old, oldOwned := ts.hIcon, ts.ownsHIcon
 	ts.hIcon, ts.ownsHIcon = h, true
 	ts.mu.Unlock()
 
 	nid := ts.buildNID(t.Tooltip)
-	if err := shellNotifyIcon(nimModify, nid); err != nil {
-		return err
-	}
+	err = shellNotifyIcon(nimModify, nid)
 	if oldOwned && old != 0 {
 		procDestroyIcon.Call(old)
 	}
-	return nil
+	return err
 }
 
 // SetMenuItems replaces the context menu shown on the next right-click —

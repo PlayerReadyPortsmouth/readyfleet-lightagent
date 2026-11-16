@@ -29,7 +29,13 @@ func applyLightUpdate(downloadedPath, version, signerFingerprint string) error {
 		return err
 	}
 
-	if err := verify.VerifyAuthenticode(downloadedPath, signerFingerprint); err != nil {
+	// Personal PCs never trust ReadyFleet's private signing root (see
+	// lightinstall.verifyBundledAgent), so the chain-to-trusted-root check
+	// would refuse every BYOD self-update. The update was already
+	// SHA-256-verified against the C2's target before reaching here; the
+	// signer-fingerprint pin inside VerifyAuthenticodeAllowUntrustedRoot
+	// remains the authority.
+	if err := verify.VerifyAuthenticodeAllowUntrustedRoot(downloadedPath, signerFingerprint); err != nil {
 		return fmt.Errorf("authenticode: %w", err)
 	}
 

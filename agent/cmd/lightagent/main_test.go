@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"sort"
 	"testing"
 
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/consent"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/runtime"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/trayicon"
@@ -18,8 +20,19 @@ func (fakeNotifier) Notify(title, body string, severity trayicon.NotifySeverity,
 	return nil
 }
 
+// fakeGate satisfies gate without a desktop to draw a prompt on.
+type fakeGate struct {
+	called  bool
+	outcome consent.Outcome
+}
+
+func (f *fakeGate) Decide(context.Context, consent.Request) consent.Outcome {
+	f.called = true
+	return f.outcome
+}
+
 // TestLightHandlers_ExactCommandSet is Task 4's explicit Step 1 acceptance
-// bar: the handler set must equal exactly these six kinds — no more
+// bar: the handler set must equal exactly these seven kinds — no more
 // (that would put a capability on the wire the byod_solarbeam allowlist
 // doesn't grant anyway, but the binary itself should never even try), no
 // fewer (that would silently break a permitted capability).
@@ -27,12 +40,13 @@ func TestLightHandlers_ExactCommandSet(t *testing.T) {
 	manager := solarbeam.New(solarbeam.Paths{})
 	updater := update.New(update.Config{})
 
-	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakePrompter{})
+	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakeGate{}, nil, nil, "")
 
 	want := []proto.CommandKind{
 		proto.CmdInventoryRefresh,
 		proto.CmdStartSolarbeam,
 		proto.CmdStopSolarbeam,
+		proto.CmdSetSolarbeamAvailability,
 		proto.CmdSolarbeamEngineUpdate,
 		proto.CmdUpdate,
 		proto.CmdShowNotification,
@@ -53,7 +67,7 @@ func TestLightHandlers_ExactCommandSet(t *testing.T) {
 func TestLightHandlers_NeverIncludesManagedOnlyKinds(t *testing.T) {
 	manager := solarbeam.New(solarbeam.Paths{})
 	updater := update.New(update.Config{})
-	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakePrompter{})
+	handlers := LightHandlers(manager, updater, fakeNotifier{}, &fakeGate{}, nil, nil, "")
 
 	// Wire values, not the proto.Cmd* constants. What must never be handled
 	// is the value that arrives on the wire: a constant renamed or removed
@@ -92,12 +106,3 @@ func handlerKinds(handlers map[proto.CommandKind]runtime.Handler) []string {
 	sort.Strings(out)
 	return out
 }
-
-// fakePrompter stands in for the connection-request dialog: the real one
-// blocks on a human and needs a window.
-type fakePrompter struct {
-	called bool
-	answer bool
-}
-
-func (f *fakePrompter) Prompt(string, string) bool { f.called = true; return f.answer }

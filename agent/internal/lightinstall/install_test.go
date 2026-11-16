@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,7 +107,7 @@ func newTestManager() (*Manager, *[]string) {
 		calls = append(calls, "verify:"+exePath)
 		return nil
 	}
-	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload) error {
+	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload, onPending func()) error {
 		calls = append(calls, "enroll")
 		return nil
 	}
@@ -116,6 +117,10 @@ func newTestManager() (*Manager, *[]string) {
 	}
 	m.registerTaskFn = func(agentExePath string) error {
 		calls = append(calls, "registerTask:"+agentExePath)
+		return nil
+	}
+	m.prepareEngineFn = func() error {
+		calls = append(calls, "prepareEngine")
 		return nil
 	}
 	m.startAgentFn = func(agentExePath string) error {
@@ -154,7 +159,7 @@ func TestManager_Install_OrderAndSuccess(t *testing.T) {
 
 	want := []string{
 		"verify:agent.exe", "enroll", "protectKey:client.key", "registerTask:agent.exe",
-		"startAgent:agent.exe", "waitForConnected:lightagent.log",
+		"prepareEngine", "startAgent:agent.exe", "waitForConnected:lightagent.log",
 	}
 	assertCallOrder(t, *calls, want)
 }
@@ -172,7 +177,8 @@ func TestManager_Install_StartAgentFailure_StopsBeforeWaitForConnected(t *testin
 		t.Fatalf("Install error = %v, want wrapping %v", err, wantErr)
 	}
 	assertCallOrder(t, *calls, []string{
-		"verify:agent.exe", "enroll", "protectKey:client.key", "registerTask:agent.exe", "startAgent:agent.exe",
+		"verify:agent.exe", "enroll", "protectKey:client.key", "registerTask:agent.exe",
+		"prepareEngine", "startAgent:agent.exe",
 	})
 }
 
@@ -190,7 +196,7 @@ func TestManager_Install_WaitForConnectedFailure(t *testing.T) {
 	}
 	assertCallOrder(t, *calls, []string{
 		"verify:agent.exe", "enroll", "protectKey:client.key", "registerTask:agent.exe",
-		"startAgent:agent.exe", "waitForConnected:lightagent.log",
+		"prepareEngine", "startAgent:agent.exe", "waitForConnected:lightagent.log",
 	})
 }
 
@@ -202,8 +208,41 @@ func TestManager_Install_ReportsProgress(t *testing.T) {
 	if err := m.Install(context.Background(), Payload{}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if len(steps) != 6 {
-		t.Fatalf("Progress called %d times, want 6: %v", len(steps), steps)
+	if len(steps) != 7 {
+		t.Fatalf("Progress called %d times, want 7: %v", len(steps), steps)
+	}
+}
+
+// Preparing the engine environment is a stream-quality fix, not a correctness
+// one: the agent enrolls, connects and takes commands without it, and the
+// engine still streams (just with a three-second permission wait). Failing the
+// whole install over it would trade a working machine for no machine at all.
+func TestManager_Install_PrepareEngineFailureDoesNotAbortTheInstall(t *testing.T) {
+	m, calls := newTestManager()
+	m.prepareEngineFn = func() error {
+		*calls = append(*calls, "prepareEngine")
+		return errors.New("read-only file system")
+	}
+	var steps []string
+	m.Progress = func(step string) { steps = append(steps, step) }
+
+	if err := m.Install(context.Background(), Payload{}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	assertCallOrder(t, *calls, []string{
+		"verify:agent.exe", "enroll", "protectKey:client.key", "registerTask:agent.exe",
+		"prepareEngine", "startAgent:agent.exe", "waitForConnected:lightagent.log",
+	})
+	// The mentor must be told, since silently skipping it would make a slow
+	// engine launch look like a fault with no trace of the cause.
+	var warned bool
+	for _, step := range steps {
+		if strings.Contains(step, "read-only file system") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("no progress line reported the skipped engine setup: %v", steps)
 	}
 }
 
@@ -224,7 +263,7 @@ func TestManager_Install_VerifyFailure_StopsImmediately(t *testing.T) {
 func TestManager_Install_EnrollFailure_StopsBeforeProtectKey(t *testing.T) {
 	m, calls := newTestManager()
 	wantErr := errors.New("redeem rejected")
-	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload) error {
+	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload, onPending func()) error {
 		*calls = append(*calls, "enroll")
 		return wantErr
 	}
@@ -346,9 +385,62 @@ func assertCallOrder(t *testing.T, got, want []string) {
 func TestNew_WiresRealSeams(t *testing.T) {
 	m := New(Config{})
 	if m.verifyAgentFn == nil || m.protectKeyFn == nil || m.registerTaskFn == nil ||
+		m.prepareEngineFn == nil ||
 		m.removeTaskFn == nil || m.enrollFn == nil || m.startAgentFn == nil ||
 		m.waitForConnectedFn == nil || m.unlinkOnlineFn == nil ||
 		m.removeAllFn == nil || m.writeTombstoneFn == nil {
 		t.Error("New left one or more seams unwired")
+	}
+}
+
+// The BYOD consent wait is opt-in, and the opt-in signal that reaches
+// enroll is the callback itself: a Manager with an AwaitingApproval hook
+// hands enrollLight a non-nil onPending, and invoking it surfaces a
+// human-readable label to whatever UI the caller attached.
+func TestManager_Install_AwaitingApprovalReachesEnroll(t *testing.T) {
+	m, _ := newTestManager()
+	var labels []string
+	m.AwaitingApproval = func(label string) { labels = append(labels, label) }
+
+	var onPending func()
+	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload, cb func()) error {
+		onPending = cb
+		return nil
+	}
+	if err := m.Install(context.Background(), Payload{}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if onPending == nil {
+		t.Fatal("enroll got a nil onPending despite AwaitingApproval being set")
+	}
+	onPending()
+	if len(labels) != 1 {
+		t.Fatalf("AwaitingApproval called %d times, want 1", len(labels))
+	}
+	if labels[0] == "" {
+		t.Error("AwaitingApproval label is empty — the mentor would see a blank wait screen")
+	}
+	if !strings.Contains(labels[0], "ReadyApp") {
+		t.Errorf("label %q should name where the mentor has to go to confirm", labels[0])
+	}
+}
+
+// Without an AwaitingApproval hook there is no UI to wait in front of, so
+// enroll must receive a nil onPending and fail fast on a deferred
+// redemption rather than block. This is the property that keeps the
+// sibling-files/CLI and test paths from silently hanging.
+func TestManager_Install_WithoutAwaitingApprovalPassesNilOnPending(t *testing.T) {
+	m, _ := newTestManager()
+
+	gotNonNil := false
+	m.enrollFn = func(ctx context.Context, cfg Config, payload Payload, cb func()) error {
+		gotNonNil = cb != nil
+		return nil
+	}
+	if err := m.Install(context.Background(), Payload{}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if gotNonNil {
+		t.Fatal("enroll got a non-nil onPending with no AwaitingApproval hook set")
 	}
 }

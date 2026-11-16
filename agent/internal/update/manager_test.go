@@ -2,12 +2,17 @@ package update
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/verify"
 )
 
 func TestUpdate_SHA256Mismatch_DoesNotApply(t *testing.T) {
@@ -29,6 +34,42 @@ func TestUpdate_SHA256Mismatch_DoesNotApply(t *testing.T) {
 	}
 	if applied {
 		t.Fatal("apply must NOT be called on sha mismatch")
+	}
+}
+
+func TestUpdate_RequiredDetachedSignatureIsVerified(t *testing.T) {
+	payload := []byte("signed-linux-agent")
+	sum := sha256.Sum256(payload)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := verify.Ed25519PublicKeyFingerprint(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) }))
+	defer srv.Close()
+	policy := ProductPolicy{ProductID: "readyfleet-agent", Profile: "managed", Signers: map[string]struct{}{fingerprint: {}}}
+	m := New(Config{Policy: policy, RequireDetachedSignature: true, TrustedPublicKeys: map[string]ed25519.PublicKey{fingerprint: publicKey}})
+	applied := false
+	m.ApplyFn = func(string, string, string) error { applied = true; return nil }
+	args := validManagedArgs()
+	args.URL, args.SHA256, args.SignerFingerprint = srv.URL, hex.EncodeToString(sum[:]), fingerprint
+	args.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, payload))
+	if err := m.Update(context.Background(), args); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !applied {
+		t.Fatal("signed artifact was not applied")
+	}
+	applied = false
+	args.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, []byte("other")))
+	if err := m.Update(context.Background(), args); err == nil {
+		t.Fatal("bad detached signature accepted")
+	}
+	if applied {
+		t.Fatal("bad signature reached apply")
 	}
 }
 

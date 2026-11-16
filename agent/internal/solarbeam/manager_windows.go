@@ -3,7 +3,9 @@
 package solarbeam
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -17,6 +19,7 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/winpaths"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
@@ -48,7 +51,7 @@ const (
 // %ProgramData%, and this is best-effort diagnostic capture, not something
 // worth failing the whole start over, so getting the directory wrong would
 // otherwise just silently lose the log rather than error loudly.
-const childLogDir = `C:\ProgramData\ReadyFleet\logs`
+var childLogDir = filepath.Join(winpaths.ProgramData(), "ReadyFleet", "logs")
 
 // childLogDirInteractive is ModeInteractive's per-user equivalent of
 // childLogDir — always writable by the account that's running it.
@@ -66,11 +69,15 @@ func childLogDirInteractive() string {
 // stock (standalone behaviour preserved). The path uses generic
 // SOLARBEAM_* naming and no fleetmgr/ReadyApp coupling, keeping the GPL
 // seam clean.
-const bridgeEnvDir = `C:\ProgramData\SolarBeam`
+//
+// Known gap: sunshinesvc.exe (engine 2.1.25 and earlier) opens
+// C:\ProgramData\SolarBeam\bridge.env literally, so on a PC whose Windows is
+// not on C: it needs the matching engine change to see this file.
+var bridgeEnvDir = filepath.Join(winpaths.ProgramData(), "SolarBeam")
 
 // bridgeEnvFile is the per-session env file (KEY=VALUE\n lines) the service
-// reads before launching the engine. Not a secret (only the bridge WS URL +
-// machine id), so 0644 is fine.
+// reads before launching the engine. Not a secret, but a trust root: it and
+// its folder are SYSTEM/Administrators-only (see bridgeenv_windows.go).
 var bridgeEnvFile = filepath.Join(bridgeEnvDir, "bridge.env")
 
 // serviceStateTimeout bounds how long we wait for a service stop/start to
@@ -129,36 +136,138 @@ func ensureEngineService(enginePath string) error {
 	return nil
 }
 
-// startEngine writes the per-session bridge.env then restarts
-// SunshineService so the engine relaunches fresh in bridge mode pointed at
-// the just-launched bridge. The bridge must already be listening
-// (launchBridge blocks until it is) because the engine's WS client does not
-// retry the connect.
+// startEngine applies the nonsecret service environment and reuses a healthy
+// warm engine only after that configuration has been imported successfully.
+// Secret rotation keeps a stable path; the engine reloads its bytes on reconnect.
 func (m *Manager) startEngine(args proto.SolarbeamStartArgs) error {
-	if err := writeBridgeEnv(args); err != nil {
-		return err
-	}
 	// SOLARBEAM_BRIDGE_WS switches the engine into bridge mode (spike.cpp);
 	// SOLARBEAM_MACHINE_ID is read by the engine's bridge code to validate
 	// the per-session control-capability token before injecting input. The
 	// service reads bridge.env and injects both into the engine's
 	// environment.
-	return restartEngineService()
+	mode := ""
+	if m.linkCredential != nil {
+		mode = m.linkCredential.mode
+	}
+	changed, err := writeBridgeEnv(args.MachineID, mode)
+	if err != nil {
+		return err
+	}
+	if m.warmEngineEnabled() && !changed && (mode == "" || m.linkEngineVerified) && m.healthyFn() {
+		slog.Info("solarbeam: engine already warm, skipping restart",
+			"phase", "engine_warm_reused", "session_id", args.SessionID)
+		return nil
+	}
+	if err := m.restartFn(); err != nil {
+		return err
+	}
+	if err := markBridgeEnvLoaded(); err != nil {
+		return err
+	}
+	m.linkEngineVerified = mode != ""
+	return nil
 }
 
-// writeBridgeEnv writes %ProgramData%\SolarBeam\bridge.env (KEY=VALUE\n
-// lines) the engine service reads before launching the engine. Overwrites
-// any prior session's file.
-func writeBridgeEnv(args proto.SolarbeamStartArgs) error {
-	if err := os.MkdirAll(bridgeEnvDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", bridgeEnvDir, err)
+// engineHealthy reports whether the resident engine is healthy enough to
+// hand a new session to without restarting it.
+//
+// Increment 1 is liveness only (warm-engine design §4.3, Aurora's ruling):
+// the service is Running AND a real sunshine.exe process exists. That is
+// cheap and it catches the failure that actually bit us — a bad binary
+// crash-looping under sunshinesvc, where the SERVICE reports Running while
+// no engine survives. It does not catch a hung-but-alive engine.
+//
+// TODO(warm-engine §4.3 option 2): the durable answer is connect-observed
+// health — after the bridge is up, if no engine WS connection arrives
+// within N seconds, restart the service and retry once. That directly
+// observes the property we care about instead of proxying it, and the
+// bridge already logs "engine connected"; it needs a bridge→agent signal
+// that does not exist yet, so it is deliberately out of scope here.
+func (m *Manager) engineHealthy() bool {
+	if !m.engineServiceRunning() {
+		return false
 	}
-	contents := "SOLARBEAM_BRIDGE_WS=" + bridgeWSURL + "\n" +
-		"SOLARBEAM_MACHINE_ID=" + args.MachineID + "\n"
-	if err := os.WriteFile(bridgeEnvFile, []byte(contents), 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", bridgeEnvFile, err)
+	if m.paths.Engine == "" {
+		return false
 	}
+	return processExistsByName(filepath.Base(m.paths.Engine))
+}
+
+// preloadEngine is the warm-engine start-of-day path (design §5.1): write
+// the machine-constant bridge.env and bring the engine up if it is not
+// already healthy, so the first session of the day does not pay the ~4.8s
+// cold start. An unhealthy engine (service Running but crash-looping) is
+// restarted rather than left alone, which keeps agent restart working as a
+// coarse self-heal for the wedge §4.3 option 1 cannot otherwise detect.
+func (m *Manager) preloadEngine(machineID string) error {
+	mode, err := m.compatibleLinkAuthMode()
+	if err != nil {
+		return err
+	}
+	if mode != "" && !m.linkEngineVerified && m.bridgeRunningFn() {
+		return fmt.Errorf("link authentication configuration pending until the active session ends")
+	}
+	changed, err := writeBridgeEnvWhenIdle(machineID, mode, m.bridgeRunningFn)
+	if err != nil {
+		return err
+	}
+	if !changed && (mode == "" || m.linkEngineVerified) && m.healthyFn() {
+		slog.Info("solarbeam: engine already warm at preload",
+			"phase", "engine_preload_skipped")
+		return nil
+	}
+	if err := m.restartFn(); err != nil {
+		return err
+	}
+	if err := markBridgeEnvLoaded(); err != nil {
+		return err
+	}
+	m.linkEngineVerified = mode != ""
 	return nil
+}
+
+// writeBridgeEnv returns whether the running service still needs to import
+// this configuration. The path is stable across sessions; mode is per machine.
+// The folder is re-secured on every call: an older agent may have written
+// identical legacy bytes into an inherited, user-writable folder.
+func writeBridgeEnv(machineID, mode string) (bool, error) {
+	return writeBridgeEnvWhenIdle(machineID, mode, nil)
+}
+
+func writeBridgeEnvWhenIdle(machineID, mode string, bridgeRunning func() bool) (bool, error) {
+	contents, err := linkBridgeEnvironment(machineID, windowsLinkSecretPath(), mode)
+	if err != nil {
+		return false, err
+	}
+	if _, err := secureBridgeEnvDir(); err != nil {
+		return false, fmt.Errorf("secure %s: %w", bridgeEnvDir, err)
+	}
+	old, _ := os.ReadFile(bridgeEnvFile)
+	applied, _ := os.ReadFile(bridgeEnvFile + ".applied")
+	if (string(old) != contents || string(applied) != contents) && bridgeRunning != nil && bridgeRunning() {
+		return false, fmt.Errorf("link authentication configuration pending until the active session ends")
+	}
+	if string(old) == contents {
+		return string(applied) != contents, nil
+	}
+	// Invalidate the acknowledgement before changing what the service reads.
+	if err := os.Remove(bridgeEnvFile + ".applied"); err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := writeBridgeEnvFile(bridgeEnvFile, []byte(contents)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// A failed service restart must remain pending across agent restarts. Merely
+// comparing bridge.env cannot prove the running service imported those bytes.
+func markBridgeEnvLoaded() error {
+	contents, err := os.ReadFile(bridgeEnvFile)
+	if err != nil {
+		return err
+	}
+	return writeBridgeEnvFile(bridgeEnvFile+".applied", contents)
 }
 
 // restartEngineService stops SunshineService if running, then starts it,
@@ -181,31 +290,96 @@ func restartEngineService() error {
 	if err := stopServiceIfRunning(s); err != nil {
 		return err
 	}
+	slog.Info("solarbeam: engine service start starting", "phase", "service_start_start")
 	if err := s.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", engineServiceName, err)
+		// Something else may have started it between our stop and this
+		// start — an engine MSI finishing its own service handling, or
+		// sunshinesvc's recovery action. That is the outcome we wanted, so
+		// only treat the error as fatal if the service is not on its way
+		// up. Queried once rather than waited on, so a genuine failure
+		// still surfaces immediately.
+		if st, qerr := s.Query(); qerr != nil ||
+			(st.State != svc.Running && st.State != svc.StartPending) {
+			return fmt.Errorf("start %s: %w", engineServiceName, err)
+		}
 	}
 	if !waitForServiceState(s, svc.Running, serviceStateTimeout) {
 		return fmt.Errorf("%s did not reach running within %s", engineServiceName, serviceStateTimeout)
 	}
+	slog.Info("solarbeam: engine service start confirmed", "phase", "service_start_confirmed")
 	return nil
 }
 
+// serviceStateIsPending reports whether state is one of the SCM's
+// transitional states — a service that is on its way somewhere and cannot
+// reliably be sent a control right now.
+//
+// This matters because the warm-engine work added a caller that arrives at
+// an UNKNOWN moment: the re-preload that runs straight after an engine MSI
+// install, while the installer may still be stopping or starting
+// SunshineService itself. Issuing a Stop control to a StopPending service
+// fails with ERROR_SERVICE_CANNOT_ACCEPT_CTRL, which would turn a perfectly
+// normal race into a preload error.
+func serviceStateIsPending(state svc.State) bool {
+	switch state {
+	case svc.StartPending, svc.StopPending, svc.ContinuePending, svc.PausePending:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitForServiceToSettle polls until the service leaves any transitional
+// state or timeout elapses, returning the last state it managed to read. A
+// query failure ends the wait — the caller's next operation will surface
+// the real error with better context than this helper could.
+func waitForServiceToSettle(s *mgr.Service, timeout time.Duration) svc.State {
+	deadline := time.Now().Add(timeout)
+	last := svc.Stopped
+	for {
+		st, err := s.Query()
+		if err != nil {
+			return last
+		}
+		last = st.State
+		if !serviceStateIsPending(st.State) || time.Now().After(deadline) {
+			return st.State
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
 // stopServiceIfRunning issues a Stop control if the service is not already
-// stopped, then waits for the stopped state.
+// stopped, then waits for the stopped state. A service found mid-transition
+// is allowed to settle first rather than being sent a control it cannot
+// accept — see serviceStateIsPending.
 func stopServiceIfRunning(s *mgr.Service) error {
+	slog.Info("solarbeam: engine service stop starting", "phase", "service_stop_start")
 	st, err := s.Query()
 	if err != nil {
 		return fmt.Errorf("query %s: %w", engineServiceName, err)
 	}
-	if st.State == svc.Stopped {
+	state := st.State
+	if serviceStateIsPending(state) {
+		state = waitForServiceToSettle(s, serviceStateTimeout)
+	}
+	if state == svc.Stopped {
+		slog.Info("solarbeam: engine service stop confirmed", "phase", "service_stop_confirmed", "already_stopped", true)
 		return nil
 	}
 	if _, err := s.Control(svc.Stop); err != nil {
+		// It may have reached Stopped on its own between the query above
+		// and this control (an installer completing its own stop), which
+		// is the state we were asking for.
+		if st, qerr := s.Query(); qerr == nil && st.State == svc.Stopped {
+			return nil
+		}
 		return fmt.Errorf("stop %s: %w", engineServiceName, err)
 	}
 	if !waitForServiceState(s, svc.Stopped, serviceStateTimeout) {
 		return fmt.Errorf("%s did not stop within %s", engineServiceName, serviceStateTimeout)
 	}
+	slog.Info("solarbeam: engine service stop confirmed", "phase", "service_stop_confirmed", "already_stopped", false)
 	return nil
 }
 
@@ -230,17 +404,43 @@ func waitForServiceState(s *mgr.Service, want svc.State, timeout time.Duration) 
 // next stock launch. Best-effort on the bridge/env cleanup; a failure to
 // stop the service is the only hard error (it would otherwise keep
 // capturing).
+//
+// With warm-engine enabled the engine stays up (design §4.2) and only the
+// bridge is torn down. bridge.env stays too: under §5.1 it is written at
+// agent start and its contents are machine-constant, so it no longer marks
+// a session, and deleting it would leave an engine respawned by
+// sunshinesvc running STOCK instead of in bridge mode — i.e. it would
+// silently un-warm the machine until the next agent restart. The original
+// "don't leak a stale per-session config into the next stock launch"
+// rationale does not apply when there is no next stock launch by design.
+//
+// Killing the bridge is what actually ends the session: it owns the
+// LiveKit room, so no viewer survives it, and the engine drops to its
+// reconnect loop and (with the disconnect gate reset, §4.1) back to
+// unauthorised input.
 func (m *Manager) stopSolarbeam() error {
-	if err := stopEngineService(); err != nil {
+	if m.warmEngineEnabled() {
+		if m.paths.Bridge != "" {
+			if err := stopBridgeForLinkRotation(filepath.Base(m.paths.Bridge)); err != nil {
+				return err
+			}
+		}
+		slog.Info("solarbeam: session stopped, engine left warm",
+			"phase", "stop_engine_left_warm")
+		return m.cleanupStoppedLinkAuth()
+	}
+	if err := m.stopServiceFn(); err != nil {
 		return err
 	}
 	if m.paths.Bridge != "" {
-		terminateByName(filepath.Base(m.paths.Bridge))
+		if err := stopBridgeForLinkRotation(filepath.Base(m.paths.Bridge)); err != nil {
+			return err
+		}
 	}
 	if err := os.Remove(bridgeEnvFile); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove %s: %w", bridgeEnvFile, err)
 	}
-	return nil
+	return m.cleanupStoppedLinkAuth()
 }
 
 // stopEngineService stops SunshineService if it is installed and running. A
@@ -288,26 +488,79 @@ func (m *Manager) engineServiceRunning() bool {
 // per-session relaunch and on teardown. The agent runs as LocalSystem,
 // which can terminate processes in other sessions.
 func terminateByName(name string) {
+	forEachProcessNamed(name, func(pid uint32) bool {
+		if h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid); err == nil {
+			_ = windows.TerminateProcess(h, 1)
+			_ = windows.CloseHandle(h)
+		}
+		return true // keep going: kill every matching instance
+	})
+}
+
+// processExistsByName reports whether at least one process with image name
+// name (case-insensitive) exists. Used by engineHealthy to tell a genuinely
+// resident engine apart from a service the SCM calls Running while
+// sunshinesvc crash-loops the binary underneath it, and by
+// bridgeProcessRunning as SessionActive's outer gate.
+//
+// A snapshot failure reports false. That is the safe direction for both
+// callers: engineHealthy then restarts rather than trusting a warm engine
+// it cannot see, and bridgeProcessRunning is only reached in ModeManaged
+// where an unreadable process table means we are not going to be able to
+// establish a session anyway.
+func processExistsByName(name string) bool {
+	if name == "" {
+		return false
+	}
+	found := false
+	forEachProcessNamed(name, func(uint32) bool {
+		found = true
+		return false // first hit is enough
+	})
+	return found
+}
+
+// bridgeProcessRunning reports whether the agent-launched bridge process
+// exists — SessionActive's outer gate (see its doc comment). An unset
+// bridge path reports false: a Manager with no bridge configured cannot
+// have launched one, so it cannot be hosting a session.
+func (m *Manager) bridgeProcessRunning() bool {
+	if m.paths.Bridge == "" {
+		return false
+	}
+	return processExistsByName(filepath.Base(m.paths.Bridge))
+}
+
+// forEachProcessNamed walks the process table and calls visit with the pid
+// of every process whose image name matches name (case-insensitive),
+// stopping early when visit returns false. Callers that establish teardown
+// authority must check the error: an unreadable snapshot is not an empty one.
+func forEachProcessNamed(name string, visit func(pid uint32) bool) error {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
-		return
+		return err
 	}
 	defer windows.CloseHandle(snap)
 	var pe windows.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
 	if err := windows.Process32First(snap, &pe); err != nil {
-		return
+		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			return nil
+		}
+		return err
 	}
 	target := strings.ToLower(name)
 	for {
 		if strings.ToLower(windows.UTF16ToString(pe.ExeFile[:])) == target {
-			if h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID); err == nil {
-				_ = windows.TerminateProcess(h, 1)
-				_ = windows.CloseHandle(h)
+			if !visit(pe.ProcessID) {
+				return nil
 			}
 		}
 		if err := windows.Process32Next(snap, &pe); err != nil {
-			return
+			if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+				return nil
+			}
+			return err
 		}
 	}
 }
@@ -362,41 +615,104 @@ func (m *Manager) launchBridge(args proto.SolarbeamStartArgs) error {
 		return fmt.Errorf("bridge path not configured")
 	}
 	// Clear a stale bridge from a prior session so it can rebind bridgeWSAddr.
-	terminateByName(filepath.Base(m.paths.Bridge))
-	cmd := newHiddenCmd(m.paths.Bridge)
-	cmd.Env = append(os.Environ(),
+	if err := stopBridgeForLinkRotation(filepath.Base(m.paths.Bridge)); err != nil {
+		return err
+	}
+	if err := m.provisionPlatformLinkAuth(); err != nil {
+		return err
+	}
+	env := append(m.linkAuthEnvironment(os.Environ()),
 		"READYAPP_URL="+args.ReadyappURL,
 		"SESSION_ID="+args.SessionID,
 		"SOLARBEAM_MACHINE_ID="+args.MachineID,
 		"SOLARBEAM_BUNDLE_TOKEN="+args.BundleToken,
 	)
 	// Best-effort stdout/stderr capture to bridge.log so publish/connect
-	// failures are visible. os/exec passes the file's handle to the child,
-	// so closing our copy after Start is safe — the child keeps its own.
+	// failures are visible. The child writes into a pipe the agent drains
+	// into a size-capped rotating log (childlog.go) — it used to be handed an
+	// O_APPEND file directly, which nothing ever rotated (97 MB on
+	// Ports-Admin, 26 Sep 2026). A log failure never fails the launch.
 	logDir := childLogDir
 	if m.paths.Mode == ModeInteractive {
 		logDir = childLogDirInteractive()
 	}
-	if err := os.MkdirAll(logDir, 0o755); err == nil {
-		if logf, ferr := os.OpenFile(filepath.Join(logDir, "bridge.log"),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
-			cmd.Stdout = logf
-			cmd.Stderr = logf
-			defer logf.Close()
+	logw := openChildLog(logDir, "bridge.log", 0o755, 0o644)
+	restricted := m.restrictedBridge()
+	slog.Info("solarbeam: bridge process spawn starting", "phase", "bridge_spawn_start",
+		"session_id", args.SessionID, "restricted", restricted)
+	var pid int
+	var wait func() int
+	if restricted {
+		proc, copied, err := startRestrictedBridgeFn(m.paths.Bridge, env, logw)
+		if err != nil {
+			_ = logw.Close()
+			return fmt.Errorf("start restricted bridge: %w", err)
+		}
+		pid = proc.Pid
+		wait = func() int {
+			state, err := proc.Wait()
+			<-copied
+			if err != nil {
+				return -1
+			}
+			return state.ExitCode()
+		}
+	} else {
+		cmd := newHiddenCmd(m.paths.Bridge)
+		cmd.Env = env
+		cmd.Stdout, cmd.Stderr = logw, logw
+		cmd.WaitDelay = childPipeWaitDelay
+		startErr := cmd.Start()
+		cmd.Env = withoutLinkAuth(cmd.Env)
+		if err := startErr; err != nil {
+			_ = logw.Close()
+			return fmt.Errorf("start bridge: %w", err)
+		}
+		pid = cmd.Process.Pid
+		wait = func() int {
+			_ = cmd.Wait()
+			if cmd.ProcessState == nil {
+				return -1
+			}
+			return cmd.ProcessState.ExitCode()
 		}
 	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start bridge: %w", err)
-	}
+	// Reap the child, detach its log and record why it ended: the bridge
+	// exits by itself with a distinct code when its session ends (3) or
+	// LiveKit is lost (4). Wait also releases the pipe and process handle,
+	// which a fire-and-forget Start would otherwise leak. Session state is
+	// cleared by the reaper (sessionowner.go), which also covers a bridge
+	// this agent instance did not launch.
+	go func(sessionID string, pid int) {
+		code := wait()
+		_ = logw.Close()
+		slog.Info("solarbeam: bridge process exited", "phase", "bridge_exited",
+			"session_id", sessionID, "pid", pid, "exit_code", code, "meaning", BridgeExitMeaning(code))
+	}(args.SessionID, pid)
 	// Block until the bridge is listening on its local WS — the engine
-	// launch follows and the engine does not retry the connect. The bridge
-	// fetches its venue bundle and joins LiveKit before it listens, so
-	// allow generous time; if it crashes (e.g. bundle/LiveKit failure) it
-	// never listens and this surfaces the failure instead of starting an
-	// engine that cannot connect.
+	// launch follows and the engine does not retry the connect.
+	//
+	// ⚠ Stale assumption, corrected 2026-08-19: this comment used to say the
+	// bridge fetches its venue bundle and joins LiveKit BEFORE it listens, so
+	// "listening" implied "LiveKit-viable". The codec-negotiation branch
+	// (solarbeam-livekit-bridge) reordered that — the bridge now listens
+	// FIRST (so the engine can complete the codec-resolution handshake
+	// before any LiveKit publish is shaped) and only connects to LiveKit
+	// afterward. So `waitForListener` returning success here no longer
+	// guarantees the bridge can actually reach LiveKit — a connect failure
+	// can still happen after this call returns, and the engine we launch
+	// next has no retry, so it inherits that failure with no clean signal
+	// back to us. The bridge repo mitigates this on its side (closes its
+	// listener immediately on a post-listen LiveKit failure, so a
+	// subsequent engine connect attempt fails fast rather than hanging) —
+	// see solarbeam-livekit-bridge's own fix for the matching finding. A
+	// real fix here would need a genuine post-listen liveness signal from
+	// the bridge (not just "the TCP port is open") — tracked as a follow-up,
+	// not solved by this comment alone.
 	if err := waitForListener(bridgeWSAddr, 30*time.Second); err != nil {
 		return fmt.Errorf("bridge not listening on %s: %w", bridgeWSAddr, err)
 	}
+	slog.Info("solarbeam: bridge listener confirmed", "phase", "bridge_listener_confirmed", "session_id", args.SessionID)
 	return nil
 }
 
@@ -447,23 +763,23 @@ func (m *Manager) startEngineInteractive(args proto.SolarbeamStartArgs) error {
 		m.interactiveEngineProc = nil
 	}
 	cmd := buildEngineCmd(m.paths.Engine, args)
+	cmd.Env = m.linkAuthEnvironment(cmd.Env)
 	// Best-effort stdout/stderr capture to engine.log, mirroring
-	// launchBridge's bridge.log. Hiding the console window above means a
-	// crash or startup failure would otherwise leave NO trace anywhere —
-	// the only place the engine's own diagnostics went was the console
-	// window this same change just suppressed.
-	if err := os.MkdirAll(childLogDirInteractive(), 0o755); err == nil {
-		if logf, ferr := os.OpenFile(filepath.Join(childLogDirInteractive(), "engine.log"),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
-			cmd.Stdout = logf
-			cmd.Stderr = logf
-			defer logf.Close()
-		}
-	}
-	if err := cmd.Start(); err != nil {
+	// launchBridge's bridge.log (same size-capped rotating log). Hiding the
+	// console window above means a crash or startup failure would otherwise
+	// leave NO trace anywhere — the only place the engine's own diagnostics
+	// went was the console window this same change just suppressed.
+	logw := openChildLog(childLogDirInteractive(), "engine.log", 0o755, 0o644)
+	cmd.Stdout, cmd.Stderr = logw, logw
+	cmd.WaitDelay = childPipeWaitDelay
+	startErr := cmd.Start()
+	cmd.Env = withoutLinkAuth(cmd.Env)
+	if err := startErr; err != nil {
+		_ = logw.Close()
 		return fmt.Errorf("start engine: %w", err)
 	}
 	m.interactiveEngineProc = cmd.Process
+	go func() { _ = cmd.Wait(); _ = logw.Close() }()
 	return nil
 }
 
@@ -476,9 +792,11 @@ func (m *Manager) stopSolarbeamInteractive() error {
 		m.interactiveEngineProc = nil
 	}
 	if m.paths.Bridge != "" {
-		terminateByName(filepath.Base(m.paths.Bridge))
+		if err := stopBridgeForLinkRotation(filepath.Base(m.paths.Bridge)); err != nil {
+			return err
+		}
 	}
-	return nil
+	return m.cleanupStoppedLinkAuth()
 }
 
 // engineProcessRunning reports whether the interactively-launched engine

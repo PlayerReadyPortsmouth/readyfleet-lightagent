@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+    version="1.0.0.0"
+    processorArchitecture="*"
+    name="PlayerReady.ReadyFleet.LightInstaller"
+    type="win32"
+  />
+  <description>ReadyFleet Light Agent Setup</description>
+  <!--
+    ComCtl32 v6 dependency: without this, Windows silently loads the
+    ancient v5 common controls DLL, which does not implement
+    TaskDialogIndirect at all — the wizard UI (agent/internal/installerui)
+    depends entirely on this being present. Standard boilerplate, not
+    installer-specific.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <!--
+    This installer never needs admin rights (the whole point of the BYOD
+    design — current-user install, HKCU Run-key startup entry) — declare
+    that explicitly so Windows never offers to elevate it and so a
+    reviewer of this manifest doesn't have to take that on faith.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <!-- Per-monitor DPI awareness so the wizard renders crisply on modern displays. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
