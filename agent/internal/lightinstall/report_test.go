@@ -106,3 +106,20 @@ func TestReportEmptyLogsAreArrayAndPEMFragmentsNeverLeaveDevice(t *testing.T) {
 		})
 	}
 }
+
+func TestRedactUsernamesInsideSecretsCannotSplitCredentials(t *testing.T) {
+	t.Setenv("USER", "Alice")
+	t.Setenv("USERNAME", "Alice")
+	for _, secret := range []string{
+		"rfp_aaaAliceBBBBCCCCDDDDEEEE",
+		"QQQQQQQQAliceBBBBCCCCDDDDEEEEFFFFGGGG",
+	} {
+		out := redactBlock(secret)
+		if out != "[redacted]" || strings.Contains(out, "QQQQQQQQ") || strings.Contains(out, "BBBBCCCC") {
+			t.Fatalf("username replacement split a credential into surviving fragments: %q", out)
+		}
+	}
+	if out := redactBlock("Setup for Alice stopped"); out != "Setup for [user] stopped" {
+		t.Fatalf("plain username was not redacted: %q", out)
+	}
+}

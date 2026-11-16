@@ -29,18 +29,6 @@ func Redact(s string) string {
 }
 
 func redactBlock(s string) string {
-	for _, value := range []string{os.Getenv("USERNAME"), os.Getenv("USER"), os.Getenv("USERPROFILE"), os.Getenv("HOME")} {
-		if value != "" {
-			s = regexp.MustCompile("(?i)"+regexp.QuoteMeta(value)).ReplaceAllString(s, "[user]")
-		}
-	}
-	if u, err := user.Current(); err == nil {
-		for _, v := range []string{u.Username, u.Name, u.HomeDir} {
-			if v != "" {
-				s = regexp.MustCompile("(?i)"+regexp.QuoteMeta(v)).ReplaceAllString(s, "[user]")
-			}
-		}
-	}
 	for _, pattern := range []string{
 		`(?i)-----BEGIN[\s\S]*`,
 		`(?i)(rft_|rfk_|rfc_|rfp_)[A-Za-z0-9_-]+`,
@@ -52,6 +40,20 @@ func redactBlock(s string) string {
 		`[A-Za-z0-9_-]{32,}`,
 	} {
 		s = regexp.MustCompile(pattern).ReplaceAllString(s, "[redacted]")
+	}
+	// Scrub complete credentials before names: replacing a username inside
+	// a token first can split it into short fragments that evade the patterns.
+	for _, value := range []string{os.Getenv("USERNAME"), os.Getenv("USER"), os.Getenv("USERPROFILE"), os.Getenv("HOME")} {
+		if value != "" {
+			s = regexp.MustCompile("(?i)"+regexp.QuoteMeta(value)).ReplaceAllString(s, "[user]")
+		}
+	}
+	if u, err := user.Current(); err == nil {
+		for _, v := range []string{u.Username, u.Name, u.HomeDir} {
+			if v != "" {
+				s = regexp.MustCompile("(?i)"+regexp.QuoteMeta(v)).ReplaceAllString(s, "[user]")
+			}
+		}
 	}
 	s = strings.Map(func(r rune) rune {
 		if r < ' ' && r != '\t' && r != '\n' {
