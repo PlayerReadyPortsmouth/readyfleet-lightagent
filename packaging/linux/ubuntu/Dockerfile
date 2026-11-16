@@ -12,3 +12,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CC=gcc-14 CXX=g++-14
 RUN apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev && \
     rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends nasm patch libx264-dev libx265-dev && \
+    rm -rf /var/lib/apt/lists/*

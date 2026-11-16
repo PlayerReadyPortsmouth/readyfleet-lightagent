@@ -23,6 +23,7 @@ openssl genpkey -algorithm ED25519 -out "$work/test-key.pem" >/dev/null 2>&1
 openssl pkey -in "$work/test-key.pem" -pubout -out "$work/public.pem"
 fingerprint=$(openssl pkey -pubin -in "$work/public.pem" -outform DER | tail -c32 | sha256sum | cut -d' ' -f1)
 openssl pkeyutl -sign -rawin -inkey "$work/test-key.pem" -in "$work/bundle.tar.zst" -out "$work/bundle.tar.zst.sig"
+cp "$work/bundle.tar.zst.sig" "$work/ed25519.sig"
 build=("$repo/packaging/linux/build-native-packages.sh" "$work/bundle.tar.zst" "$work/public.pem" "$fingerprint" 1.2.3)
 "${build[@]}" "$work/out"
 "${build[@]}" "$work/arch-only" arch
@@ -59,6 +60,21 @@ fi
 if "$repo/packaging/linux/build-native-packages.sh" "$work/bundle.tar.zst" "$work/public.pem" "$(printf '%064d' 0)" 1.2.3 "$work/bad-pin" >/dev/null 2>&1; then
   echo 'accepted wrong signer fingerprint' >&2; exit 1
 fi
+# An alternative algorithm must fail before interpreting a tail-of-DER pin.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/rsa.pem" >/dev/null 2>&1
+openssl pkey -in "$work/rsa.pem" -pubout -out "$work/rsa-public.pem"
+rsa_pin=$(openssl pkey -pubin -in "$work/rsa-public.pem" -outform DER | tail -c32 | sha256sum | cut -d' ' -f1)
+openssl pkeyutl -sign -rawin -inkey "$work/rsa.pem" -in "$work/bundle.tar.zst" -out "$work/bundle.tar.zst.sig"
+if "$repo/packaging/linux/build-native-packages.sh" "$work/bundle.tar.zst" "$work/rsa-public.pem" "$rsa_pin" 1.2.3 "$work/rsa-output" arch > "$work/rsa-log" 2>&1; then
+  echo 'accepted a non-Ed25519 release key' >&2; exit 1
+fi
+grep -q 'must be an Ed25519 SPKI key' "$work/rsa-log"
+cp "$work/ed25519.sig" "$work/bundle.tar.zst.sig"
+cp "$work/bundle.tar.zst" "$work/bad&name.tar.zst"
+if "$repo/packaging/linux/build-native-packages.sh" "$work/bad&name.tar.zst" "$work/public.pem" "$fingerprint" 1.2.3 "$work/bad-name" arch > "$work/name-log" 2>&1; then
+  echo 'accepted unsafe PKGBUILD source filename' >&2; exit 1
+fi
+grep -q 'invalid bundle basename' "$work/name-log"
 # A future-ABI ELF in the library payload must prevent Ubuntu packaging.
 printf 'int future(void) { return 0; }\n' > "$work/future.c"
 printf 'GLIBC_99.0 { global: future; };\n' > "$work/future.map"

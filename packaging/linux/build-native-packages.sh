@@ -6,6 +6,8 @@ if (( $# < 5 || $# > 6 )); then
   exit 2
 fi
 bundle=$(realpath "$1")
+bundle_name=$(basename "$bundle")
+[[ $bundle_name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.zst$ ]] || { echo 'invalid bundle basename' >&2; exit 2; }
 public_key=$(realpath "$2")
 expected_fingerprint=$3
 version=$4
@@ -18,6 +20,9 @@ case "$target" in ubuntu|arch|both) ;; *) echo "unknown target: $target" >&2; ex
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 openssl pkey -pubin -in "$public_key" -outform DER -out "$work/public.der"
+[[ $(wc -c < "$work/public.der") == 44 && $(od -An -tx1 -N12 "$work/public.der" | tr -d '[:space:]') == 302a300506032b6570032100 ]] || {
+  echo 'release public key must be an Ed25519 SPKI key' >&2; exit 3;
+}
 # A PEM chosen by an attacker is not a trust anchor; pin it before verification.
 [[ $(tail -c 32 "$work/public.der" | sha256sum | cut -d' ' -f1) == "$expected_fingerprint" ]] || { echo 'signer fingerprint mismatch' >&2; exit 3; }
 openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" -sigfile "$bundle.sig" -in "$bundle"

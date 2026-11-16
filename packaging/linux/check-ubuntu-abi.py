@@ -9,8 +9,10 @@ import sys
 def check(root: pathlib.Path) -> None:
     baseline = (2, 39)
     for relative in ('readyfleet-light', 'readyfleet-light-installer', 'engine/sunshine', 'engine/solarbeam-bridge'):
-        if root.joinpath(relative).read_bytes()[:4] != b'\x7fELF':
-            raise ValueError(f'{relative}: expected prebuilt ELF executable')
+        with root.joinpath(relative).open('rb') as stream:
+            header = stream.read(20)
+        if header[:6] != b'\x7fELF\x02\x01' or header[18:20] != b'\x3e\x00':
+            raise ValueError(f'{relative}: expected prebuilt x86-64 ELF executable')
     for path in sorted(root.rglob('*')):
         if not path.is_file() or path.is_symlink():
             continue

@@ -11,7 +11,15 @@ output=$(realpath -m "$4")
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'version must be x.y.z' >&2; exit 2; }
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 go_root=$(go env GOROOT)
-BUILD_VERSION="$version" "$repo/packaging/linux/build-ubuntu-engine.sh" "$engine" "$output"
+if [[ ${PA_REUSE_ENGINE_BUILD:-0} == 1 ]]; then
+  [[ -x "$output/stage/bin/sunshine" && $(cat "$output/engine-build-version.txt") == "$version" && $(cat "$output/engine-source-commit.txt") == $(git -C "$engine" rev-parse HEAD) ]] || {
+    echo 'existing engine build version/source does not match' >&2; exit 3;
+  }
+else
+  BUILD_VERSION="$version" "$repo/packaging/linux/build-ubuntu-engine.sh" "$engine" "$output"
+fi
+git -C "$repo" rev-parse HEAD > "$output/fleet-source-commit.txt"
+git -C "$bridge" rev-parse HEAD > "$output/bridge-source-commit.txt"
 git -C "$repo" ls-files -z -- agent proto packaging/linux > "$output/fleet-source-files.nul"
 git -C "$bridge" ls-files --recurse-submodules -z > "$output/bridge-source-files.nul"
 docker run --rm -i --cpus="${BUILD_CPUS:-2}" --memory="${BUILD_MEMORY:-6g}" \

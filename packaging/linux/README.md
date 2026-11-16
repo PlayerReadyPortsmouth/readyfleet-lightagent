@@ -256,7 +256,7 @@ BUILD_VERSION=0.65.0 packaging/linux/build-ubuntu-engine.sh /path/to/solarbeam-e
 
 This requires Docker, downloads build dependencies, limits compilation to two
 jobs/six GiB by default, and never touches the source checkout or a release
-server. This lane disables CUDA toolkit code; CPU/VAAPI/Vulkan support and
+server. This lane disables CUDA toolkit code; H.264/HEVC software and VAAPI support and
 NVIDIA behavior still need validation on actual desktops. A build alone does
 not prove screen capture, input, audio, or wake.
 
@@ -289,3 +289,38 @@ one-use enrolment. The versioned miniupnpc DSO travels with the payload so a
 newer Ubuntu/Arch release does not need the old distro package name. The build
 also prefers the source-pinned NVIDIA codec headers over FFmpeg's downloaded
 headers; it keeps the engine's backwards-compatibility assertion enabled.
+
+For a separately completed engine build with matching recorded version and
+source commit, `PA_REUSE_ENGINE_BUILD=1` skips rebuilding it in the full bundle
+command. Bundle ABI/dependency checks still run. The default always builds.
+
+The isolated Ubuntu build also orders the engine's static Opus dependency
+after FFmpeg, which consumes it. The small checked patch is part of these
+recipes and does not edit the source checkout. Build provenance records the
+source commit, explicit version and release date (commit date by default).
+`PA_ENGINE_RELEASE_DATE` can preserve a prior recorded date when resuming a
+link-only fix without changing compiled metadata.
+
+The Ubuntu lane builds the engine-pinned FFmpeg source against Ubuntu's own
+libva instead of the latest downloaded FFmpeg (which requires `vaMapBuffer2`
+from a newer libva). Its bounded profile includes H.264/HEVC software and VAAPI
+encoders; FFmpeg AV1/Vulkan/CUDA encoders are disabled. The source-pinned CBS
+patches and explicit static-library dependencies are kept. This is a distinct
+Ubuntu artifact, not a claim that the CachyOS release is portable.
+
+Linux light-agent, installer and bridge builds in the production local release
+recipe also use `GOOS=linux GOARCH=amd64 CGO_ENABLED=0`. This keeps future Go
+self-updates independent of the build host's glibc. The already-published code10
+agent needs GLIBC_2.34 and works at the Ubuntu 24.04 libc baseline; its engine
+requires the separate rebuild described above.
+
+### Shared Linux convergence
+
+ReadyFleet's Linux BYOD engine target is shared by Ubuntu and CachyOS/Arch;
+this draft does not add a distro selector or change any target. Publish a
+common engine built against the Ubuntu 24.04 ABI baseline to shared Linux
+stable/beta targets after validating the required host features. An Arch-only
+GLIBC_2.44 target is refused on Ubuntu by the new signed-stage loader check,
+which preserves the installed engine and its previous backup. That machine
+will not advance until a compatible shared target is available. Linux Go
+agent/installer/bridge releases remain static, independently of the engine.

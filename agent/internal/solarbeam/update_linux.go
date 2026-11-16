@@ -63,6 +63,9 @@ func applyEngineUpdate(ctx context.Context, paths Paths, args proto.SolarbeamEng
 			return fmt.Errorf("engine package has no executable %s", binary)
 		}
 	}
+	if err := linuxEngineCompatibilityFn(ctx, stage); err != nil {
+		return fmt.Errorf("check staged Linux engine compatibility: %w", err)
+	}
 	backup := installDir + ".previous"
 	_ = os.RemoveAll(backup)
 	if err := os.Rename(installDir, backup); err != nil && !os.IsNotExist(err) {

@@ -10,8 +10,9 @@ mkdir "$work/debian"
 printf 'Source: readyfleet-light\nSection: net\nPriority: optional\nMaintainer: Player Ready <support@player-ready.co.uk>\nStandards-Version: 4.7.0\n\nPackage: readyfleet-light\nArchitecture: amd64\nDescription: Personal SolarBeam host\n' > "$work/debian/control"
 elf_args=()
 while IFS= read -r -d '' file; do
-  if readelf -h "$file" >/dev/null 2>&1; then elf_args+=("-e$file"); fi
+  if readelf -d "$file" 2>/dev/null | grep -q NEEDED; then elf_args+=("-e$file"); fi
 done < <(find "$payload" -type f -print0)
+(( ${#elf_args[@]} )) || exit 0
 # miniupnpc's versioned ABI is bundled for rolling distributions. Do not require
 # the old Ubuntu package name when that exact DSO already travels in the bundle.
 exclude=()

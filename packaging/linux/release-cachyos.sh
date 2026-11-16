@@ -61,7 +61,7 @@ signer_fingerprint=$(sha256sum "${public_raw}" | cut -d' ' -f1)
 agent_bin=${work}/readyfleet-light
 (
   cd "${repo_root}/agent"
-  go build -trimpath -ldflags "-s -w -X main.agentVersion=${version} -X main.lightLinuxPublicKey=${public_key_b64}" \
+  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.agentVersion=${version} -X main.lightLinuxPublicKey=${public_key_b64}" \
     -o "${agent_bin}" ./cmd/lightagent
 )
 agent_sha=$(sha256sum "${agent_bin}" | cut -d' ' -f1)
@@ -69,14 +69,14 @@ agent_sha=$(sha256sum "${agent_bin}" | cut -d' ' -f1)
 installer_bin=${work}/readyfleet-light-installer
 (
   cd "${repo_root}/agent"
-  go build -trimpath -ldflags "-s -w -X main.serverURL=${server_url} -X github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall.expectedAgentSHA256=${agent_sha} -X github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall.expectedSignerFingerprint=${signer_fingerprint}" \
+  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.serverURL=${server_url} -X github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall.expectedAgentSHA256=${agent_sha} -X github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall.expectedSignerFingerprint=${signer_fingerprint}" \
     -o "${installer_bin}" ./cmd/light-installer
 )
 
 bridge_bin=${work}/solarbeam-bridge
 (
   cd "${bridge_repo}"
-  go build -trimpath -ldflags "-s -w" -o "${bridge_bin}" .
+  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "${bridge_bin}" .
 )
 
 cp "${agent_bin}" "${output%/}/readyfleet-light-${version}"
