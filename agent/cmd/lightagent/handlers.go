@@ -15,6 +15,7 @@ import (
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/transport"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/trayicon"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/update"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/venuepolicy"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
@@ -24,19 +25,55 @@ type notifier interface {
 	Notify(title, body string, severity trayicon.NotifySeverity, onClick func()) error
 }
 
+// collectLightInventoryFn is the one collection seam used by both explicit
+// refreshes and the state-changing SolarBeam handlers. Tests replace it with a
+// privacy-safe fixture; production always uses lightinventory.Collect.
+var collectLightInventoryFn = lightinventory.Collect
+
+// lightInventoryProvider is the hello-triggered auto-refresh hook
+// (transport.Config.InventoryProvider): when the C2's hello_ack says
+// needs_inventory, the transport sends whatever this returns as a
+// MsgInventory. It must be the same LightInventoryData the
+// CmdInventoryRefresh handler sends, because the C2 strict-decodes every
+// MsgInventory from a byod_solarbeam machine into that one type and rejects
+// any other shape outright (dispatch: strict-decode BYOD inventory).
+//
+// Until 9 Nov 2026 this hook returned an empty proto.InventoryData on the
+// theory that the strict path "doesn't exist yet". It did: the zero-valued
+// "hostname" field made the C2 drop every hello-time inventory with
+// `json: unknown field "hostname"`, so a Mac's SolarBeam host report (and its
+// agent version, OS and architecture) never landed after a reconnect.
+func lightInventoryProvider(agentVersion string, manager *solarbeam.Manager) func(context.Context) (any, error) {
+	return func(ctx context.Context) (any, error) {
+		return collectLightInventoryFn(ctx, agentVersion, manager)
+	}
+}
+
 // LightHandlers builds the light entrypoint's complete, exhaustive handler
-// map — exactly the six command kinds byod_solarbeam's capability
+// map — exactly the narrow command kinds byod_solarbeam's capability
 // allowlist (server/internal/capability/policy.go) permits. This IS the
 // enforcement seam Task 4's design relies on: there is no handler for any
 // other kind because this binary never compiles one in, not because
 // something filters requests at runtime.
-func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier, prompt prompter) map[proto.CommandKind]runtime.Handler {
+//
+// indicator may be nil — that is the shipped default, and every call site
+// below treats nil as "no on-screen indicator on this machine".
+//
+// policy is the C2's authenticated venue policy for this connection. A nil
+// or still-unknown policy refuses every start_solarbeam, exactly as the
+// managed agent does (venuepolicy.State.StartAllowed). ownerActorID is the
+// enrolled owner (config); a C2 requester_is_owner marker is only honoured
+// when the requester matches it.
+func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier, consentGate gate, indicator *sessionIndicatorDriver, policy *venuepolicy.State, ownerActorID string) map[proto.CommandKind]runtime.Handler {
 	return map[proto.CommandKind]runtime.Handler{
 		proto.CmdInventoryRefresh: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
 			runInventoryRefresh(ctx, env, send, manager)
 		},
 		proto.CmdStartSolarbeam: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
-			runStartSolarbeam(ctx, env, send, manager)
+			runStartSolarbeam(ctx, env, send, manager, indicator, policy, ownerActorID)
+		},
+		proto.CmdSetSolarbeamAvailability: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
+			runSetSolarbeamAvailability(ctx, env, send, manager)
 		},
 		proto.CmdStopSolarbeam: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
 			runStopSolarbeam(ctx, env, send, manager)
@@ -48,31 +85,40 @@ func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify n
 			runSelfUpdate(ctx, env, send, updater)
 		},
 		proto.CmdShowNotification: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
-			runShowNotification(ctx, env, send, notify, prompt)
+			runShowNotification(ctx, env, send, notify, consentGate, indicator)
 		},
 	}
 }
 
 func runInventoryRefresh(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, manager *solarbeam.Manager) {
 	start := time.Now()
-	inv, err := lightinventory.Collect(ctx, agentVersion, manager)
-	if err != nil {
-		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: "inventory collect: " + err.Error()}, start)
-		return
-	}
-	invEnv, err := proto.NewEnvelope(proto.MsgInventory, uuid.Nil, &cmdEnv.ID, inv)
-	if err != nil {
-		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: "build inventory envelope: " + err.Error()}, start)
-		return
-	}
-	if err := send(ctx, invEnv); err != nil {
-		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: "send inventory: " + err.Error()}, start)
+	if err := sendLightInventory(ctx, cmdEnv.ID, send, manager); err != nil {
+		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: err.Error()}, start)
 		return
 	}
 	emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: 0}, start)
 }
 
-func runStartSolarbeam(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, manager *solarbeam.Manager) {
+// sendLightInventory publishes the current privacy-safe BYOD snapshot. Start
+// and stop use it immediately after changing the engine state so ReadyApp does
+// not keep showing the last periodic value (for example "stopped" while a
+// session is already connected).
+func sendLightInventory(ctx context.Context, correlationID uuid.UUID, send transport.SendFunc, manager *solarbeam.Manager) error {
+	inv, err := collectLightInventoryFn(ctx, agentVersion, manager)
+	if err != nil {
+		return fmt.Errorf("inventory collect: %w", err)
+	}
+	invEnv, err := proto.NewEnvelope(proto.MsgInventory, uuid.Nil, &correlationID, inv)
+	if err != nil {
+		return fmt.Errorf("build inventory envelope: %w", err)
+	}
+	if err := send(ctx, invEnv); err != nil {
+		return fmt.Errorf("send inventory: %w", err)
+	}
+	return nil
+}
+
+func runStartSolarbeam(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, manager *solarbeam.Manager, indicator *sessionIndicatorDriver, policy *venuepolicy.State, ownerActorID string) {
 	start := time.Now()
 	var args proto.SolarbeamStartArgs
 	if err := decodeArgs(cmdEnv, &args, proto.CmdStartSolarbeam); err != nil {
@@ -85,9 +131,41 @@ func runStartSolarbeam(ctx context.Context, cmdEnv proto.Envelope, send transpor
 		}, start)
 		return
 	}
+	// Core Team (require_connection_approval) venues: the agent-side half of
+	// the C2's per-session approval gate, the same check the managed agent
+	// makes. Before the indicator and the engine, so a refused start never
+	// streams a frame.
+	decision := ""
+	if policy != nil {
+		decision = policy.StartDecision(args, ownerActorID)
+	}
+	if decision == "" {
+		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{
+			ExitCode: -1, Error: "connection approval required or venue policy unavailable",
+		}, start)
+		return
+	}
+	if decision == venuepolicy.StartOwnerSelf || decision == venuepolicy.StartAssigned {
+		// No prompt was shown; the session indicator below still runs for
+		// the whole session.
+		slog.Info("owner connection, no prompt", "decision", decision, "session_id", args.SessionID, "requester_id", args.RequesterID)
+	}
+	// The one place the require_session_indicator policy is applied.
+	// Before the engine is started, not after: a session refused here has
+	// never streamed a frame. Returns nil unless the operator set that
+	// key — see sessionIndicatorDriver.GateSessionStart.
+	if err := indicator.GateSessionStart(); err != nil {
+		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: err.Error()}, start)
+		return
+	}
 	if err := manager.Start(ctx, args); err != nil {
 		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: err.Error()}, start)
 		return
+	}
+	if err := sendLightInventory(ctx, cmdEnv.ID, send, manager); err != nil {
+		// The stream is already live. Do not turn a reporting failure into a
+		// false launch failure; the next refresh can reconcile it.
+		slog.Warn("solarbeam started but live inventory update failed", "error", err)
 	}
 	emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: 0, Duration: time.Since(start)}, start)
 }
@@ -108,6 +186,11 @@ func runStopSolarbeam(ctx context.Context, cmdEnv proto.Envelope, send transport
 	if err := manager.Stop(ctx, args); err != nil {
 		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: -1, Error: err.Error()}, start)
 		return
+	}
+	if err := sendLightInventory(ctx, cmdEnv.ID, send, manager); err != nil {
+		// The session is already stopped; keep the command result truthful and
+		// let a later refresh repair the displayed state.
+		slog.Warn("solarbeam stopped but live inventory update failed", "error", err)
 	}
 	emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: 0, Duration: time.Since(start)}, start)
 }
@@ -141,7 +224,7 @@ func severityFromWire(s string) trayicon.NotifySeverity {
 	}
 }
 
-func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, notify notifier, prompt prompter) {
+func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, notify notifier, consentGate gate, indicator *sessionIndicatorDriver) {
 	start := time.Now()
 	var args proto.ShowNotificationArgs
 	if err := decodeArgs(cmdEnv, &args, proto.CmdShowNotification); err != nil {
@@ -154,13 +237,23 @@ func runShowNotification(ctx context.Context, cmdEnv proto.Envelope, send transp
 		}, start)
 		return
 	}
-	// A connection request is a question the mentor has to answer, so it gets
-	// a dialog that waits for them rather than a balloon that fades. Every
-	// other kind stays a balloon: they are notices, not questions.
-	if args.Kind == connectionRequestKind && prompt != nil {
-		showConnectionRequest(prompt, args.Title, args.Body, args.URL)
+	// A connection request is a question somebody has to answer, so it goes
+	// through the consent gate: unattended for this device's own owner, a
+	// prompt that waits for anyone else, a decline for every path where the
+	// question could not be put and answered. Every other kind stays a
+	// plain notice — they are statements, not questions.
+	if args.Kind == connectionRequestKind && consentGate != nil {
+		showConnectionRequest(consentGate, args, send)
 		emitResult(ctx, send, cmdEnv.ID, proto.ResultData{ExitCode: 0, Duration: time.Since(start)}, start)
 		return
+	}
+	// session_started additionally names the viewer for the on-screen
+	// bar: for that kind Body IS the display name (see
+	// sessionStartedKind). It stays a normal notice as well — the
+	// notification is still shown below, unchanged — so a machine with no
+	// indicator loses nothing by this.
+	if args.Kind == sessionStartedKind && indicator != nil {
+		indicator.SetViewer(args.Body)
 	}
 
 	var onClick func()
@@ -221,4 +314,18 @@ func emitResult(ctx context.Context, send transport.SendFunc, parentID uuid.UUID
 		return
 	}
 	_ = send(ctx, env)
+}
+
+func runSetSolarbeamAvailability(ctx context.Context, env proto.Envelope, send transport.SendFunc, manager *solarbeam.Manager) {
+	start := time.Now()
+	var args proto.SetSolarbeamAvailabilityArgs
+	err := decodeArgs(env, &args, proto.CmdSetSolarbeamAvailability)
+	if err == nil {
+		err = manager.SetRemoteHostingEnabled(ctx, args.Enabled)
+	}
+	if err != nil {
+		emitResult(ctx, send, env.ID, proto.ResultData{ExitCode: -1, Error: err.Error()}, start)
+		return
+	}
+	emitResult(ctx, send, env.ID, proto.ResultData{ExitCode: 0}, start)
 }

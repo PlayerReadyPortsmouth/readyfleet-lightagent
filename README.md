@@ -1,88 +1,44 @@
 # ReadyFleet Light Agent (BYOD)
 
-The agent that runs on a **personal** machine so it can host SolarBeam
-sessions. Published so you can read it before you install it, and check that
-what we ship is what is written here.
+This is the generated public source for ReadyFleet's personal-device light
+agent and installer. Regenerate it from ReadyFleet; do not hand-edit runtime
+files in this mirror. The current source can be newer than a published release.
 
-This repository is **generated** from ReadyFleet and is read-only. Nothing is
-typed into it directly, so it cannot drift from the agent you are running.
+The controller commands are listed in [CONTRACT.md](CONTRACT.md). Managed venue
+commands are removed from the protocol: 168 declarations kept, 426 omitted.
+The agent reports only its OS, architecture, its own version and SolarBeam host
+readiness. The full venue hardware/software inventory collector is excluded.
 
-## What it can do
-
-Six commands, listed in [CONTRACT.md](CONTRACT.md). That is the whole surface.
-
-Build and test it yourself — this is a Go workspace, so the paths are explicit:
+Build and run the checks from this workspace:
 
     go build ./agent/... ./proto/...
-    go test  ./agent/... ./proto/...
-
-## What it cannot do
-
-There is no remote shell, no screen capture, no terminal, no ability to read
-your files, and no service installation. That is not a promise — it is
-checked. `cmd/lightagent/safety_test.go` compiles the binary and fails
-if it contains the tells of any of those capabilities:
-
     go test ./agent/... ./proto/...
 
-The wire protocol here is pruned to what this agent references: 55
-declarations kept, 41 belonging to the separate managed-venue fleet removed.
-Their absence is deliberate and is itself part of the guarantee.
+The copied safety tests compile the agent and check its import boundary and
+forbidden capability strings. There is no venue remote shell, terminal or
+Windows service installation in this agent. SolarBeam's separate streaming
+engine supplies the screen stream with the consent policy in this source.
 
-## Verify what you were given
+Windows runs as the current user from LocalAppData with an HKCU login entry.
+Linux runs as a desktop-user systemd service. Its optional system integration
+asks for sudo to configure input devices; enrolment and the agent remain under
+the desktop account. macOS uses the platform-specific current-user startup path.
 
-Builds here are deterministic: build twice, or against a colleague's build,
-and the bytes match. What you **cannot** do is match the hash of the binary
-we publish, and the reason is deliberate rather than evasive.
+The resilient installer canary is selected by the signed enrolment payload.
+It checks prerequisites, retries safe network operations, repairs an install
+using credentials for the expected device owner, and rolls back its own files
+when it cannot finish. Installer reports contain the version, OS, failed step,
+error category and redacted diagnostic lines. A scoped, short-lived reporting
+credential sends them to ReadyApp; Discord webhook secrets exist only on the
+server. Enrolment credentials are never part of a diagnostic report.
 
-Our released build compiles the full ReadyFleet protocol package, which
-declares commands for the separate managed-venue fleet. Those declarations are
-removed here on purpose — see above — and Go derives part of a binary's
-identity from its source, so different source means different bytes even
-though no removed declaration is reachable from this agent. Measured, not
-assumed: the two builds differ.
+## Verify a download
 
-So the guarantee is this instead:
+The published Windows agent download returns x-artifact-sha256 and
+x-artifact-signer-fingerprint headers. Compare the downloaded bytes' SHA-256
+and its Windows Digital Signatures signer with those values before running it.
+Linux release bundles are signed separately and verified by the downloader.
 
-- **Every line that runs on your machine is here.** Only the unused protocol
-  declarations differ, and removing them is what stops this repository
-  disclosing capabilities aimed at machines that are not yours.
-- **The capability boundary is testable.** `go test ./agent/... ./proto/...` runs the same checks we do.
-- **The file you were given is the file we published.** The download endpoint
-  returns both values as response headers — not just a claim, a value you can
-  fetch and diff yourself:
-
-      curl -sI https://readyapp.player-ready.co.uk/releases/agent-download/windows-byod-agent/<versionCode>
-
-  gives `x-artifact-sha256` and `x-artifact-signer-fingerprint`. Hash the file you were
-  given and compare; open its Properties → Digital Signatures in Windows
-  Explorer and confirm the signer thumbprint matches. Either mismatching means
-  the download was tampered with in transit — stop and don't run it.
-
-## A known gap in the pruning
-
-Six commands is the real surface (above) — but `proto/messages.go` here also
-declares several managed-fleet DATA shapes (`HardwareInfo`, `DiskInfo`,
-`NetworkInfo`, `TelemetryData`, `GPUInfo`, `ThermalInfo`) that this agent never
-populates. Not a leaked capability — the forbidden-symbol check that generates
-this repository would refuse to publish one of those — but worth being
-straight about rather than leaving unexplained.
-
-Why they're here: this agent and the managed one share a config struct
-(`internal/runtime.Config`), and that struct declares hooks for both. This
-agent's own inventory hook is a permanent stub:
-
-    InventoryProvider: func(ctx context.Context) (proto.InventoryData, error) {
-        return proto.InventoryData{}, nil
-    },
-
-— see `cmd/lightagent/main.go` — and never sets the telemetry hook at all. The
-struct field's TYPE still has to be declared for the shared code to compile,
-which is what pulls the shape declarations in. No instance of this agent has
-ever sent one populated.
-
-## How it runs
-
-Current user only, from your own `%LocalAppData%` — no administrator
-rights at any point, and no Windows service. It starts when you log in and
-connects outbound only.
+A mirror build uses pruned protocol source, so it does not reproduce the exact
+bytes of the private full-protocol release build. The import-boundary tests
+and the published artifact signatures are separate checks.

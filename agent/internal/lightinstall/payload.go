@@ -25,20 +25,24 @@ import (
 
 const maxPayloadBytes = 16 * 1024
 
-// lightTokenPattern matches an rft_ single-use enrollment token — the
-// same shape the managed installer requires, minted for a byod_solarbeam
-// enrollment token specifically (server-side, the token's own stored
-// agent_profile decides what the redeemed machine becomes; this pattern
-// only validates the wire shape, not the profile).
-var lightTokenPattern = regexp.MustCompile(`^rft_[A-Za-z0-9_-]{43}$`)
+// lightTokenPattern matches the two bearers a light install may redeem:
+// an rft_ single-use enrollment token (the per-person composed download),
+// or an rfc_ pairing code (the unified installer; 9 characters from the
+// pairing alphabet, any tier on the wire — the C2 resolves it to the
+// byod_solarbeam token it wraps). Only the wire shape is validated here;
+// the server's stored credential decides the profile.
+var lightTokenPattern = regexp.MustCompile(`^(rft_[A-Za-z0-9_-]{43}|rfc_[A-HJ-NP-Z2-9]{9})$`)
 
 // Payload is the complete on-disk enrollment schema for a light install.
-// Deliberately one field — unlike the managed payload's
-// requested_name_base, BYOD enrollment always gets a server-generated
-// BYOD-###### name and rejects a requested one (server/internal/api/enrollment_tokens.go,
-// Task 1 of this build), so there is nothing else for this payload to carry.
+// The legacy schema has one enrolment token. Compatible canary builds may
+// also carry report-only scope and expected owner metadata. A payload cannot
+// select a controller/report URL or a managed profile.
 type Payload struct {
-	EnrollmentToken string `json:"enrollment_token"`
+	EnrollmentToken      string `json:"enrollment_token"`
+	ResilientInstall     bool   `json:"resilient_install,omitempty"`
+	FailureReportToken   string `json:"failure_report_token,omitempty"`
+	PairingCodeID        string `json:"pairing_code_id,omitempty"`
+	ExpectedOwnerActorID string `json:"expected_owner_actor_id,omitempty"`
 }
 
 // LoadPayload reads a bounded payload file and strictly decodes it via
@@ -75,19 +79,38 @@ func ParsePayload(body []byte) (Payload, error) {
 		return Payload{}, invalidPayload("invalid JSON")
 	}
 	var payload Payload
-	seen := false
+	seen := map[string]bool{}
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
 			return Payload{}, invalidPayload("invalid JSON")
 		}
 		key, ok := token.(string)
-		if !ok || key != "enrollment_token" || seen {
+		if !ok || seen[key] {
 			return Payload{}, invalidPayload("unexpected or duplicate field")
 		}
-		seen = true
-		if err := decoder.Decode(&payload.EnrollmentToken); err != nil {
-			return Payload{}, invalidPayload("field must be a string")
+		seen[key] = true
+		var target any
+		switch key {
+		case "enrollment_token":
+			target = &payload.EnrollmentToken
+		case "resilient_install":
+			target = &payload.ResilientInstall
+		case "failure_report_token":
+			target = &payload.FailureReportToken
+		case "pairing_code_id":
+			target = &payload.PairingCodeID
+		case "expected_owner_actor_id":
+			target = &payload.ExpectedOwnerActorID
+		default:
+			return Payload{}, invalidPayload("unexpected field")
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil || string(raw) == "null" {
+			return Payload{}, invalidPayload("invalid field type")
+		}
+		if err := json.Unmarshal(raw, target); err != nil {
+			return Payload{}, invalidPayload("invalid field type")
 		}
 	}
 	last, err := decoder.Token()
@@ -97,8 +120,16 @@ func ParsePayload(body []byte) (Payload, error) {
 	if token, err := decoder.Token(); !errors.Is(err, io.EOF) || token != nil {
 		return Payload{}, invalidPayload("trailing data")
 	}
-	if !seen || !lightTokenPattern.MatchString(payload.EnrollmentToken) {
+	if !seen["enrollment_token"] || !lightTokenPattern.MatchString(payload.EnrollmentToken) {
 		return Payload{}, invalidPayload("single-use enrollment token required")
+	}
+	if seen["failure_report_token"] || seen["pairing_code_id"] {
+		if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(payload.FailureReportToken) || !regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(payload.PairingCodeID) {
+			return Payload{}, invalidPayload("invalid reporting scope")
+		}
+	}
+	if seen["expected_owner_actor_id"] && !regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(payload.ExpectedOwnerActorID) {
+		return Payload{}, invalidPayload("invalid owner")
 	}
 	return payload, nil
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/signedin"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
@@ -121,10 +122,23 @@ type Config struct {
 	OS        string
 	OSVersion string
 
+	// SACProbe, if non-nil, is read on every hello to report the Smart App
+	// Control posture (see internal/sacposture). Read-only.
+	SACProbe func() (state string, checkedAt time.Time)
+
+	// SignedInProbe, if non-nil, is read on hello and on every telemetry
+	// sample to report the interactive session's account (internal/signedin).
+	SignedInProbe func() (user string, since time.Time)
+
+	// AttendedProbe, if non-nil, derives TelemetryData.Attended from the
+	// sample's signed-in report (internal/attended). Set only on the managed
+	// Windows agent with the activity_signals kill switch on.
+	AttendedProbe func(signedIn *proto.SignedInReport) *proto.AttendedReport
+
 	// InventoryProvider, if non-nil, is called whenever the server
 	// signals NeedsInventory in the hello_ack. The returned snapshot
 	// is sent as a MsgInventory.
-	InventoryProvider func(ctx context.Context) (proto.InventoryData, error)
+	InventoryProvider func(ctx context.Context) (any, error)
 
 	// TelemetryProvider, if non-nil, is called every TelemetryInterval (or
 	// defaultTelemetryInterval if zero) and the result pushed unsolicited as
@@ -138,6 +152,34 @@ type Config struct {
 	// Zero means defaultTelemetryInterval (15s).
 	TelemetryInterval time.Duration
 
+	// MachineEventsProvider, if non-nil, is called every
+	// MachineEventsInterval to collect Windows event-log/WER deltas
+	// (agent/internal/wineventlog). Returning (nil, nil) means "nothing
+	// new" and skips the send entirely — most collections on a healthy
+	// machine are empty.
+	MachineEventsProvider func(ctx context.Context) (*proto.MachineEventsData, error)
+	// MachineEventsInterval is the collection cadence (default 15m). The
+	// caller should add a per-machine stagger offset before the first tick
+	// so a venue of eight machines doesn't burst together.
+	MachineEventsInterval time.Duration
+	// MachineEventsStagger delays the FIRST collection after connect.
+	MachineEventsStagger time.Duration
+
+	// SecurityPostureProvider, if non-nil, is called every
+	// SecurityPostureInterval (default 30m) to sample Defender / firewall /
+	// Windows Update state (agent/internal/security). Unlike machine
+	// events, posture is state, not deltas — every sample sends.
+	SecurityPostureProvider func(ctx context.Context) (*proto.SecurityPostureData, error)
+	SecurityPostureInterval time.Duration
+
+	// HelloAckObserver, if non-nil, receives every hello_ack after the
+	// handshake — the channel server-supplied observation config (e.g.
+	// the Steam Family View keys) rides in on. Called on the dispatch
+	// goroutine; implementations must be quick and thread-safe.
+	HelloAckObserver func(ack proto.HelloAckData)
+	// VenuePolicyObserver resets on reconnect and receives authenticated policy.
+	VenuePolicyObserver func(*proto.VenuePolicy)
+
 	// CommandHandler, if non-nil, receives every MsgCommand. It runs
 	// in its own goroutine; the implementation is responsible for
 	// streaming MsgOutput back via the provided Send func and for
@@ -148,6 +190,23 @@ type Config struct {
 	// messages (open/input/resize/close). It dispatches them to the
 	// agent's stateful TerminalManager.
 	TerminalHandler TerminalHandler
+
+	// OverrideDecisionHandler, if non-nil, receives server→agent
+	// override_decision messages (software-control staff override replies).
+	OverrideDecisionHandler func(ctx context.Context, env proto.Envelope)
+
+	// ConsentDismissHandler, if non-nil, receives server→agent
+	// consent_dismiss messages (owner decided in ReadyApp).
+	ConsentDismissHandler func(ctx context.Context, env proto.Envelope)
+
+	// OperatingModeGrantResponseHandler, if non-nil, receives server→agent
+	// operating_mode_grant_response messages (answers to the venue PIN
+	// requests this agent sent with [Client.Send]).
+	OperatingModeGrantResponseHandler func(ctx context.Context, env proto.Envelope)
+
+	// ComputeHandler, if non-nil, receives server→agent compute_lease,
+	// compute_no_work and compute_cancel messages (ReadyCloudCompute).
+	ComputeHandler func(ctx context.Context, env proto.Envelope)
 
 	// ScreenHandler, if non-nil, receives the server→agent screen_start /
 	// screen_stop messages and dispatches them to the agent's ScreenCapManager.
@@ -197,12 +256,37 @@ type Client struct {
 	cfg    Config
 	logger *slog.Logger
 
+	// sleepFn waits out one reconnect delay, reporting false if ctx was
+	// cancelled first. A seam only so tests can observe the backoff
+	// schedule without waiting out the real 1s..60s delays; production
+	// always runs [sleepBackoff].
+	sleepFn func(ctx context.Context, d time.Duration) bool
+
 	mu            sync.Mutex
 	running       bool
 	stats         Stats
 	paused        bool
 	pauseWake     chan struct{}
 	cancelCurrent context.CancelFunc
+	// current is the live connection after hello, nil otherwise; Send uses it
+	// for agent-initiated messages that are not replies to a command.
+	current *persistentConn
+}
+
+// ErrNotConnected is returned by [Client.Send] while no connection is live.
+var ErrNotConnected = errors.New("transport: not connected to the controller")
+
+// Send queues an agent-initiated envelope (not a command reply) on the live
+// connection. It never waits for a reconnect: a caller that needs an answer
+// reports "not connected" and lets its user retry.
+func (c *Client) Send(ctx context.Context, env proto.Envelope) error {
+	c.mu.Lock()
+	pc := c.current
+	c.mu.Unlock()
+	if pc == nil {
+		return ErrNotConnected
+	}
+	return pc.Send(ctx, env)
 }
 
 // NewClient returns a Client. It does not start any I/O until [Client.Run].
@@ -211,7 +295,22 @@ func NewClient(cfg Config) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Client{cfg: cfg, logger: logger, pauseWake: make(chan struct{})}
+	return &Client{
+		cfg:       cfg,
+		logger:    logger,
+		pauseWake: make(chan struct{}),
+		sleepFn:   sleepBackoff,
+	}
+}
+
+// sleepBackoff waits d out, returning false if ctx is cancelled first.
+func sleepBackoff(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 // Stats returns a snapshot of the current connection state.
@@ -301,10 +400,8 @@ func (c *Client) Run(ctx context.Context) error {
 		delay := backoff.Next()
 		c.logger.Info("agent reconnect scheduled",
 			"err", err, "delay", delay.String())
-		select {
-		case <-ctx.Done():
+		if !c.sleepFn(ctx, delay) {
 			return nil
-		case <-time.After(delay):
 		}
 	}
 }
@@ -328,8 +425,15 @@ func (c *Client) connectAndServe(ctx context.Context) (retErr error) {
 		c.mu.Lock()
 		c.cancelCurrent = nil
 		c.mu.Unlock()
+		// Read attemptCtx's state BEFORE cancelling it. cancel() makes
+		// Err() non-nil unconditionally, so testing it afterwards would
+		// call every failure a pause and skip the reconnect backoff —
+		// turning a refused dial into a hot loop. Clearing cancelCurrent
+		// above already means no later SetPaused can cancel this attempt,
+		// so this read sees exactly the pause that raced the failure.
+		abortedMidAttempt := attemptCtx.Err() != nil
 		cancel()
-		if retErr != nil && ctx.Err() == nil && attemptCtx.Err() != nil {
+		if retErr != nil && ctx.Err() == nil && abortedMidAttempt {
 			retErr = errPausedMidConnection
 		}
 	}()
@@ -366,13 +470,23 @@ func (c *Client) connectAndServe(ctx context.Context) (retErr error) {
 	connCtx := attemptCtx
 
 	// Send hello.
-	helloEnv, err := proto.NewEnvelope(proto.MsgHello, uuid.Nil, nil, proto.HelloData{
-		ProtocolVersion: proto.ProtocolVersion,
-		AgentVersion:    c.cfg.AgentVersion,
-		MachineID:       c.cfg.MachineID,
-		OS:              c.cfg.OS,
-		OSVersion:       c.cfg.OSVersion,
-	})
+	if c.cfg.VenuePolicyObserver != nil {
+		c.cfg.VenuePolicyObserver(nil)
+	}
+	hello := proto.HelloData{
+		VenuePolicySupported: true,
+		ProtocolVersion:      proto.ProtocolVersion,
+		AgentVersion:         c.cfg.AgentVersion,
+		MachineID:            c.cfg.MachineID,
+		OS:                   c.cfg.OS,
+		OSVersion:            c.cfg.OSVersion,
+		SignedIn:             signedin.Report(c.cfg.SignedInProbe),
+	}
+	if c.cfg.SACProbe != nil {
+		state, at := c.cfg.SACProbe()
+		hello.SACState, hello.SACCheckedAt = state, &at
+	}
+	helloEnv, err := proto.NewEnvelope(proto.MsgHello, uuid.Nil, nil, hello)
 	if err != nil {
 		return err
 	}
@@ -384,7 +498,15 @@ func (c *Client) connectAndServe(ctx context.Context) (retErr error) {
 	c.stats.Connected = true
 	c.stats.ConnectedSince = time.Now()
 	c.stats.ConnectCount++
+	c.current = pc
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.current == pc {
+			c.current = nil
+		}
+		c.mu.Unlock()
+	}()
 
 	// Run pumps.
 	readErr := make(chan error, 1)
@@ -395,6 +517,10 @@ func (c *Client) connectAndServe(ctx context.Context) (retErr error) {
 	go func() { pingErr <- pc.pingLoop(connCtx) }()
 	telemetryErr := make(chan error, 1)
 	go func() { telemetryErr <- c.telemetryLoop(connCtx, pc) }()
+	machineEventsErr := make(chan error, 1)
+	go func() { machineEventsErr <- c.machineEventsLoop(connCtx, pc) }()
+	postureErr := make(chan error, 1)
+	go func() { postureErr <- c.securityPostureLoop(connCtx, pc) }()
 
 	select {
 	case err := <-readErr:
@@ -404,6 +530,10 @@ func (c *Client) connectAndServe(ctx context.Context) (retErr error) {
 	case err := <-pingErr:
 		return err
 	case err := <-telemetryErr:
+		return err
+	case err := <-machineEventsErr:
+		return err
+	case err := <-postureErr:
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
@@ -423,6 +553,12 @@ func (c *Client) dispatch(ctx context.Context, pc *persistentConn, env proto.Env
 			"server_time", ack.ServerTime,
 			"needs_inventory", ack.NeedsInventory,
 		)
+		if c.cfg.VenuePolicyObserver != nil {
+			c.cfg.VenuePolicyObserver(ack.VenuePolicy)
+		}
+		if c.cfg.HelloAckObserver != nil {
+			c.cfg.HelloAckObserver(ack)
+		}
 		if ack.NeedsInventory && c.cfg.InventoryProvider != nil {
 			go c.sendInventory(ctx, pc)
 		}
@@ -452,12 +588,36 @@ func (c *Client) dispatch(ctx context.Context, pc *persistentConn, env proto.Env
 		go c.cfg.TerminalHandler(ctx, env, pc.Send)
 		return nil
 
-	case proto.MsgScreenStart, proto.MsgScreenStop:
+	case proto.MsgScreenStart, proto.MsgScreenStop, proto.MsgViewingStarted, proto.MsgViewingStopped:
 		if c.cfg.ScreenHandler == nil {
 			c.logger.Warn("ignoring screen message (no handler installed)", "type", env.Type)
 			return nil
 		}
 		go c.cfg.ScreenHandler(ctx, env, pc.Send)
+		return nil
+
+	case proto.MsgOverrideDecision:
+		if c.cfg.OverrideDecisionHandler != nil {
+			go c.cfg.OverrideDecisionHandler(ctx, env)
+		}
+		return nil
+
+	case proto.MsgConsentDismiss:
+		if c.cfg.ConsentDismissHandler != nil {
+			go c.cfg.ConsentDismissHandler(ctx, env)
+		}
+		return nil
+
+	case proto.MsgOperatingModeGrantResponse:
+		if c.cfg.OperatingModeGrantResponseHandler != nil {
+			go c.cfg.OperatingModeGrantResponseHandler(ctx, env)
+		}
+		return nil
+
+	case proto.MsgComputeLease, proto.MsgComputeNoWork, proto.MsgComputeCancel:
+		if c.cfg.ComputeHandler != nil {
+			go c.cfg.ComputeHandler(ctx, env)
+		}
 		return nil
 
 	case proto.MsgCancel:
@@ -524,6 +684,10 @@ func (c *Client) telemetryLoop(ctx context.Context, pc *persistentConn) error {
 			c.logger.Warn("telemetry collection failed", "err", err)
 			continue
 		}
+		data.SignedIn = signedin.Report(c.cfg.SignedInProbe)
+		if c.cfg.AttendedProbe != nil {
+			data.Attended = c.cfg.AttendedProbe(data.SignedIn)
+		}
 		env, err := proto.NewEnvelope(proto.MsgTelemetry, uuid.Nil, nil, data)
 		if err != nil {
 			c.logger.Warn("telemetry envelope", "err", err)
@@ -531,6 +695,84 @@ func (c *Client) telemetryLoop(ctx context.Context, pc *persistentConn) error {
 		}
 		if err := pc.Send(ctx, env); err != nil {
 			return err
+		}
+	}
+}
+
+// machineEventsLoop runs the event-log/WER collector on its interval,
+// mirroring telemetryLoop's conventions (non-nil return on ctx cancel; a
+// provider error logs and skips the tick). Two differences: an initial
+// stagger delay so venue machines don't collect in lockstep, and a nil
+// batch from the provider (nothing new) is silently skipped.
+func (c *Client) machineEventsLoop(ctx context.Context, pc *persistentConn) error {
+	if c.cfg.MachineEventsProvider == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	interval := c.cfg.MachineEventsInterval
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	if d := c.cfg.MachineEventsStagger; d > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		data, err := c.cfg.MachineEventsProvider(ctx)
+		if err != nil {
+			c.logger.Warn("machine events collection failed", "err", err)
+		} else if data != nil {
+			env, err := proto.NewEnvelope(proto.MsgMachineEvents, uuid.Nil, nil, data)
+			if err != nil {
+				c.logger.Warn("machine events envelope", "err", err)
+			} else if err := pc.Send(ctx, env); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// securityPostureLoop samples and sends security posture on its interval,
+// with an immediate first sample after connect (posture staleness across a
+// reconnect is exactly when the server most wants a fresh read — e.g. a
+// machine coming back after sitting off for a week).
+func (c *Client) securityPostureLoop(ctx context.Context, pc *persistentConn) error {
+	if c.cfg.SecurityPostureProvider == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	interval := c.cfg.SecurityPostureInterval
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		data, err := c.cfg.SecurityPostureProvider(ctx)
+		if err != nil {
+			c.logger.Warn("security posture collection failed", "err", err)
+		} else if data != nil {
+			env, err := proto.NewEnvelope(proto.MsgSecurityPosture, uuid.Nil, nil, data)
+			if err != nil {
+				c.logger.Warn("security posture envelope", "err", err)
+			} else if err := pc.Send(ctx, env); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
 		}
 	}
 }

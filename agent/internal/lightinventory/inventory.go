@@ -42,6 +42,13 @@ func Collect(ctx context.Context, agentVersion string, manager *solarbeam.Manage
 		} else {
 			data.SolarbeamStatus = "stopped"
 		}
+		// Host report (#213 wire shape): what this host can actually do, so the C2 and
+		// ReadyApp never assume a capability the platform lacks (capability honesty).
+		a := manager.HostAvailability()
+		data.SolarbeamHost = &proto.SolarbeamHostReport{
+			Enabled: a.Enabled, Available: a.Available, Reason: a.Reason,
+			Capabilities: proto.SolarbeamHostCapabilities(a.Capabilities),
+		}
 	}
 
 	return data, nil

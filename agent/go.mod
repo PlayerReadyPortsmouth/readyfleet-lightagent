@@ -12,16 +12,21 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/yusufpapurcu/wmi v1.2.4
-	golang.org/x/sys v0.44.0
+	golang.org/x/sys v0.47.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
+	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/rajveermalviya/go-wayland/wayland v0.0.0-20230130181619-0ad78d1310b2 // indirect
 	github.com/u-root/u-root v0.16.0 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/image v0.45.0 // indirect
 )
 
 replace github.com/playerreadyportsmouth/readyfleet/proto => ../proto
