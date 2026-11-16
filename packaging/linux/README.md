@@ -281,3 +281,11 @@ your installed Go toolchain), then assembles an unsigned developer tar bundle.
 It records the engine source commit and stamps the explicit build version; it
 never uses a production signing key or publishes anything. A release operator
 must sign the verified output before native release packaging.
+
+The Ubuntu developer bundle includes an `ubuntu-runtime-packages` manifest
+resolved against Ubuntu's shlibs database before enrolment. The setup script
+installs those packages and checks the engine's loader before consuming the
+one-use enrolment. The versioned miniupnpc DSO travels with the payload so a
+newer Ubuntu/Arch release does not need the old distro package name. The build
+also prefers the source-pinned NVIDIA codec headers over FFmpeg's downloaded
+headers; it keeps the engine's backwards-compatibility assertion enabled.

@@ -10,6 +10,7 @@ public_key=$(realpath "$2")
 expected_fingerprint=$3
 version=$4
 output=$5
+sha=$(sha256sum "$bundle" | cut -d' ' -f1)
 target=${6:-both}
 case "$target" in ubuntu|arch|both) ;; *) echo "unknown target: $target" >&2; exit 2 ;; esac
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'version must be x.y.z' >&2; exit 2; }
@@ -43,14 +44,7 @@ runtime_deps=''
 # A portable shell-only package must not guess libminiupnpc/ICU sonames from
 # the Arch build host. Static test fixtures need no shlibs metadata.
 if readelf -d "$payload/engine/sunshine" 2>/dev/null | grep -q NEEDED; then
-  command -v dpkg-shlibdeps >/dev/null || { echo 'Build Ubuntu packages in the Ubuntu builder image (dpkg-shlibdeps required).' >&2; exit 3; }
-  mkdir -p "$work/debian"
-  printf 'Source: readyfleet-light\nSection: net\nPriority: optional\nMaintainer: Player Ready <support@player-ready.co.uk>\nStandards-Version: 4.7.0\n\nPackage: readyfleet-light\nArchitecture: amd64\nDescription: Personal SolarBeam host\n' > "$work/debian/control"
-  elf_args=()
-  while IFS= read -r -d '' file; do
-    if readelf -h "$file" >/dev/null 2>&1; then elf_args+=("-e$file"); fi
-  done < <(find "$payload" -type f -print0)
-  runtime_deps=$(cd "$work" && dpkg-shlibdeps -O --ignore-missing-info -l"$payload/engine/lib" "${elf_args[@]}" | sed -n 's/^shlibs:Depends=//p')
+  runtime_deps=$("$(dirname "$0")/ubuntu/runtime-dependencies.sh" "$payload")
   [[ -n $runtime_deps ]] || { echo 'Ubuntu runtime dependencies could not be resolved' >&2; exit 3; }
 fi
 root="$work/deb"
@@ -59,7 +53,6 @@ cp -a "$payload/." "$root/usr/lib/readyfleet-light/"
 install -m0755 "$(dirname "$0")/readyfleet-light-enrol" "$root/usr/bin/readyfleet-light-enrol"
 cp "$bundle.sig" "$root/usr/share/doc/readyfleet-light/bundle.sig"
 cp "$public_key" "$root/usr/share/doc/readyfleet-light/release-public.pem"
-sha=$(sha256sum "$bundle" | cut -d' ' -f1)
 printf '%s  %s\n' "$sha" "$(basename "$bundle")" > "$root/usr/share/doc/readyfleet-light/bundle.sha256"
 cat > "$work/control/control" <<CONTROL
 Package: readyfleet-light

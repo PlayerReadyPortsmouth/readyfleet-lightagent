@@ -25,6 +25,9 @@ fingerprint=$(openssl pkey -pubin -in "$work/public.pem" -outform DER | tail -c3
 openssl pkeyutl -sign -rawin -inkey "$work/test-key.pem" -in "$work/bundle.tar.zst" -out "$work/bundle.tar.zst.sig"
 build=("$repo/packaging/linux/build-native-packages.sh" "$work/bundle.tar.zst" "$work/public.pem" "$fingerprint" 1.2.3)
 "${build[@]}" "$work/out"
+"${build[@]}" "$work/arch-only" arch
+[[ -f "$work/arch-only/readyfleet-light-1.2.3-arch/PKGBUILD" ]]
+[[ ! -f "$work/arch-only/readyfleet-light_1.2.3_amd64.deb" ]]
 (cd "$work/out" && sha256sum -c readyfleet-light_1.2.3_amd64.deb.sha256)
 mkdir "$work/deb"
 (cd "$work/deb" && ar x "$work/out/readyfleet-light_1.2.3_amd64.deb")
@@ -49,6 +52,10 @@ arch="$work/out/readyfleet-light-1.2.3-arch"
   [[ -x pkg/usr/bin/readyfleet-light-enrol ]]
   [[ -x pkg/usr/lib/readyfleet-light/engine/sunshine ]]
 )
+if command -v makepkg >/dev/null 2>&1; then
+  (cd "$arch" && makepkg --nodeps --noconfirm --force >/dev/null)
+  bsdtar -tf "$arch/readyfleet-light-1.2.3-1-x86_64.pkg.tar.zst" | grep -q 'usr/bin/readyfleet-light-enrol'
+fi
 if "$repo/packaging/linux/build-native-packages.sh" "$work/bundle.tar.zst" "$work/public.pem" "$(printf '%064d' 0)" 1.2.3 "$work/bad-pin" >/dev/null 2>&1; then
   echo 'accepted wrong signer fingerprint' >&2; exit 1
 fi
@@ -62,5 +69,12 @@ fi
 printf 'tamper' >> "$work/bundle.tar.zst"
 if "${build[@]}" "$work/bad" >/dev/null 2>&1; then
   echo 'accepted a tampered bundle' >&2; exit 1
+fi
+if [[ -n ${PA_TEST_ARTIFACTS:-} ]]; then
+  mkdir -p "$PA_TEST_ARTIFACTS"
+  cp "$work/out/readyfleet-light_1.2.3_amd64.deb" "$PA_TEST_ARTIFACTS/"
+  if [[ -f "$arch/readyfleet-light-1.2.3-1-x86_64.pkg.tar.zst" ]]; then
+    cp "$arch/readyfleet-light-1.2.3-1-x86_64.pkg.tar.zst" "$PA_TEST_ARTIFACTS/"
+  fi
 fi
 printf 'native package format, checksum, pin and tamper checks passed\n'

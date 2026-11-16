@@ -40,9 +40,9 @@ Their absence is deliberate and is itself part of the guarantee.
 
 ## Verify what you were given
 
-Builds here are deterministic: build twice, or against a colleague's build,
-and the bytes match. What you **cannot** do is match the hash of the binary
-we publish, and the reason is deliberate rather than evasive.
+Use the same Go version, build flags, dependencies and source revision when
+comparing local builds. This snapshot does **not** reproduce the exact hash of
+the binary we publish.
 
 Our released build compiles the full ReadyFleet protocol package, which
 declares commands for the separate managed-venue fleet. Those declarations are
