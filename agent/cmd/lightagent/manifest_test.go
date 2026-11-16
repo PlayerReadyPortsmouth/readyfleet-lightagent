@@ -27,7 +27,7 @@ func TestLightagentBinary_CarriesComCtl32V6Manifest(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "lightagent-manifest-probe.exe")
 
-	build := exec.Command("go", "build", "-o", out, ".")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, ".")
 	build.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64")
 	if combined, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build failed: %v\n%s", err, combined)

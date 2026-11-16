@@ -1,0 +1,18 @@
+# Generated from the verified prebuilt BYOD bundle. Build as a normal user:
+# makepkg -si. Enrol afterwards as the desktop user, without sudo.
+pkgname=readyfleet-light
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Personal SolarBeam host setup for the logged-in desktop user'
+arch=('x86_64')
+url='https://github.com/PlayerReadyPortsmouth/readyfleet-lightagent'
+license=('custom')
+depends=('bash' 'sudo' 'systemd' 'libcap' 'kmod' 'udev' 'wl-clipboard' 'xclip' 'curl' 'miniupnpc' 'sqlite' 'opus' 'numactl' 'libva' 'libx11' 'openssl' 'libdrm' 'libevdev' 'vulkan-icd-loader' 'wayland' 'mesa' 'libsm' 'libice' 'libxext' 'glib2' 'pipewire' 'libpulse' 'gcc-libs' 'icu')
+options=('!strip' '!debug')
+source=('@BUNDLE@' 'readyfleet-light-enrol')
+sha256sums=('@SHA256@' '@LAUNCHER_SHA256@')
+package() {
+  install -d "$pkgdir/usr/lib/readyfleet-light"
+  cp -a "$srcdir/readyfleet-solarbeam-cachyos-x86_64/." "$pkgdir/usr/lib/readyfleet-light/"
+  install -Dm0755 "$srcdir/readyfleet-light-enrol" "$pkgdir/usr/bin/readyfleet-light-enrol"
+}

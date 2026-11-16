@@ -2,21 +2,18 @@ package update
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
-	"time"
 
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/verify"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
-const (
-	maxDownloadBytes = 200 * 1024 * 1024
-	downloadTimeout  = 5 * time.Minute
-)
+const maxDownloadBytes = 200 * 1024 * 1024
 
 // Config configures a Manager.
 type Config struct {
@@ -26,6 +23,12 @@ type Config struct {
 	DownloadDir string
 	// Policy is this entrypoint's fixed ProductPolicy — see the type doc.
 	Policy ProductPolicy
+	// TrustedPublicKeys enables detached Ed25519 verification for platforms
+	// without Authenticode. Keys are indexed by their raw-key SHA-256
+	// fingerprint, which must also pass Policy.Signers.
+	TrustedPublicKeys        map[string]ed25519.PublicKey
+	RequireDetachedSignature bool
+	TempPattern              string
 }
 
 // Manager downloads, verifies, and applies a self-update. It is
@@ -61,7 +64,7 @@ type Manager struct {
 func New(cfg Config) *Manager {
 	return &Manager{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: downloadTimeout},
+		httpClient: verify.NewTransferClient(),
 	}
 }
 
@@ -87,12 +90,27 @@ func (m *Manager) Update(ctx context.Context, args proto.UpdateArgs) error {
 		URL:         args.URL,
 		SHA256:      args.SHA256,
 		DownloadDir: m.cfg.DownloadDir,
-		TempPattern: "fleet-agent-update-*.exe",
+		TempPattern: m.tempPattern(),
 		MaxBytes:    maxDownloadBytes,
 		Client:      m.httpClient,
 	})
 	if err != nil {
 		return err
+	}
+	if m.cfg.RequireDetachedSignature {
+		if args.Signature == "" {
+			_ = os.Remove(path)
+			return errors.New("update: detached Ed25519 signature is required")
+		}
+		publicKey, ok := m.cfg.TrustedPublicKeys[args.SignerFingerprint]
+		if !ok {
+			_ = os.Remove(path)
+			return errors.New("update: no pinned Ed25519 public key for signer fingerprint")
+		}
+		if err := verify.VerifyEd25519File(path, args.Signature, args.SignerFingerprint, publicKey); err != nil {
+			_ = os.Remove(path)
+			return fmt.Errorf("update: verify detached signature: %w", err)
+		}
 	}
 
 	if m.ApplyFn == nil {
@@ -110,6 +128,13 @@ func (m *Manager) Update(ctx context.Context, args proto.UpdateArgs) error {
 		return fmt.Errorf("apply: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) tempPattern() string {
+	if m.cfg.TempPattern != "" {
+		return m.cfg.TempPattern
+	}
+	return "fleet-agent-update-*"
 }
 
 func (m *Manager) validate(a proto.UpdateArgs) error {

@@ -18,6 +18,7 @@ package runtime
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/transport"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
@@ -36,15 +37,31 @@ type Config struct {
 	MachineID                 string
 	AgentVersion              string
 	OS, OSVersion             string
+	SACProbe                  func() (string, time.Time)
+	SignedInProbe             func() (string, time.Time)
+	AttendedProbe             func(*proto.SignedInReport) *proto.AttendedReport
 	Insecure                  bool
 	Logger                    *slog.Logger
-	InventoryProvider         func(ctx context.Context) (proto.InventoryData, error)
+	InventoryProvider         func(ctx context.Context) (any, error)
 
 	// TelemetryProvider, if non-nil, is passed straight through to
 	// transport.Config — see that field's doc for the push-cadence
 	// contract. A restricted entrypoint with no telemetry capability
 	// simply leaves this nil.
 	TelemetryProvider func(ctx context.Context) (proto.TelemetryData, error)
+
+	// MachineEventsProvider/Interval/Stagger pass straight through to
+	// transport.Config — the Windows event-log/WER collector's cadence.
+	MachineEventsProvider func(ctx context.Context) (*proto.MachineEventsData, error)
+	MachineEventsInterval time.Duration
+	MachineEventsStagger  time.Duration
+
+	// SecurityPostureProvider/Interval pass through to transport.Config.
+	SecurityPostureProvider func(ctx context.Context) (*proto.SecurityPostureData, error)
+	// HelloAckObserver passes through to transport.Config.
+	HelloAckObserver        func(ack proto.HelloAckData)
+	VenuePolicyObserver     func(*proto.VenuePolicy)
+	SecurityPostureInterval time.Duration
 
 	// Handlers maps each command kind this entrypoint supports to its
 	// implementation. A kind absent from this map is reported to the
@@ -59,6 +76,14 @@ type Config struct {
 	// terminal/screen capability at all simply leaves these nil.
 	TerminalHandler transport.TerminalHandler
 	ScreenHandler   transport.ScreenHandler
+	// OverrideDecisionHandler routes software-control override replies.
+	OverrideDecisionHandler func(ctx context.Context, env proto.Envelope)
+	// ConsentDismissHandler closes a desktop prompt the owner answered in ReadyApp.
+	ConsentDismissHandler func(ctx context.Context, env proto.Envelope)
+	// OperatingModeGrantResponseHandler routes venue PIN grant answers.
+	OperatingModeGrantResponseHandler func(ctx context.Context, env proto.Envelope)
+	// ComputeHandler routes ReadyCloudCompute lease/no-work/cancel messages.
+	ComputeHandler func(ctx context.Context, env proto.Envelope)
 }
 
 // NewClient builds the transport.Client Run would otherwise construct and
@@ -69,23 +94,38 @@ type Config struct {
 // driving, rather than Run hiding it entirely.
 func NewClient(cfg Config) *transport.Client {
 	return transport.NewClient(transport.Config{
-		ServerURL:         cfg.ServerURL,
-		CertFile:          cfg.CertFile,
-		KeyFile:           cfg.KeyFile,
-		CAFile:            cfg.CAFile,
-		MachineID:         cfg.MachineID,
-		AgentVersion:      cfg.AgentVersion,
-		OS:                cfg.OS,
-		OSVersion:         cfg.OSVersion,
-		Insecure:          cfg.Insecure,
-		Logger:            cfg.Logger,
-		InventoryProvider: cfg.InventoryProvider,
-		TelemetryProvider: cfg.TelemetryProvider,
+		ServerURL:               cfg.ServerURL,
+		CertFile:                cfg.CertFile,
+		KeyFile:                 cfg.KeyFile,
+		CAFile:                  cfg.CAFile,
+		MachineID:               cfg.MachineID,
+		AgentVersion:            cfg.AgentVersion,
+		OS:                      cfg.OS,
+		OSVersion:               cfg.OSVersion,
+		SACProbe:                cfg.SACProbe,
+		SignedInProbe:           cfg.SignedInProbe,
+		AttendedProbe:           cfg.AttendedProbe,
+		Insecure:                cfg.Insecure,
+		Logger:                  cfg.Logger,
+		InventoryProvider:       cfg.InventoryProvider,
+		TelemetryProvider:       cfg.TelemetryProvider,
+		MachineEventsProvider:   cfg.MachineEventsProvider,
+		MachineEventsInterval:   cfg.MachineEventsInterval,
+		MachineEventsStagger:    cfg.MachineEventsStagger,
+		SecurityPostureProvider: cfg.SecurityPostureProvider,
+		HelloAckObserver:        cfg.HelloAckObserver,
+		VenuePolicyObserver:     cfg.VenuePolicyObserver,
+		SecurityPostureInterval: cfg.SecurityPostureInterval,
 		CommandHandler: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
 			Dispatch(ctx, cfg.Logger, cfg.Handlers, env, send)
 		},
-		TerminalHandler: cfg.TerminalHandler,
-		ScreenHandler:   cfg.ScreenHandler,
+		TerminalHandler:         cfg.TerminalHandler,
+		ScreenHandler:           cfg.ScreenHandler,
+		OverrideDecisionHandler: cfg.OverrideDecisionHandler,
+		ConsentDismissHandler:   cfg.ConsentDismissHandler,
+
+		OperatingModeGrantResponseHandler: cfg.OperatingModeGrantResponseHandler,
+		ComputeHandler:                    cfg.ComputeHandler,
 	})
 }
 

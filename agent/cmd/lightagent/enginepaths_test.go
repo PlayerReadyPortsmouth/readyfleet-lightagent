@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,15 @@ func TestLightEngineDir_IsUnderLocalAppData(t *testing.T) {
 
 	dir := lightEngineDir()
 
+	if runtime.GOOS == "darwin" {
+		// The Mac ignores LocalAppData: the SolarBeam host files live under
+		// the agent's own Application Support directory (solarbeam/), so the
+		// rollback is one directory and one config key (docs/macos-light-agent.md).
+		if !strings.HasSuffix(dir, filepath.Join("Library", "Application Support", "ReadyFleet", "solarbeam")) {
+			t.Errorf("lightEngineDir() = %q, want ~/Library/Application Support/ReadyFleet/solarbeam", dir)
+		}
+		return
+	}
 	want := filepath.Join(`C:\Users\test\AppData\Local`, "SolarBeam")
 	if dir != want {
 		t.Errorf("lightEngineDir() = %q, want %q", dir, want)
@@ -42,17 +52,28 @@ func TestLightEnginePaths_SitBesideEachOtherInTheEngineDir(t *testing.T) {
 	t.Setenv("LocalAppData", `C:\Users\test\AppData\Local`)
 
 	dir := lightEngineDir()
+	if runtime.GOOS == "darwin" {
+		// The engine is an .app bundle inside the dir; its executable is
+		// Contents/MacOS/<name> under it, the bridge sits beside the bundle.
+		if !strings.HasPrefix(lightEnginePath(), dir+string(filepath.Separator)) || !strings.HasSuffix(lightEnginePath(), platformEngineBinary()) {
+			t.Errorf("engine path = %q, want %s/%s", lightEnginePath(), dir, platformEngineBinary())
+		}
+		if got := filepath.Dir(lightBridgePath()); got != dir {
+			t.Errorf("bridge dir = %q, want %q", got, dir)
+		}
+		return
+	}
 	if got := filepath.Dir(lightEnginePath()); got != dir {
 		t.Errorf("engine dir = %q, want %q", got, dir)
 	}
 	if got := filepath.Dir(lightBridgePath()); got != dir {
 		t.Errorf("bridge dir = %q, want %q", got, dir)
 	}
-	if base := filepath.Base(lightEnginePath()); base != "sunshine.exe" {
-		t.Errorf("engine binary = %q, want sunshine.exe", base)
+	if base := filepath.Base(lightEnginePath()); base != platformEngineBinary() {
+		t.Errorf("engine binary = %q, want %s", base, platformEngineBinary())
 	}
-	if base := filepath.Base(lightBridgePath()); base != "solarbeam-bridge.exe" {
-		t.Errorf("bridge binary = %q, want solarbeam-bridge.exe", base)
+	if base := filepath.Base(lightBridgePath()); base != platformBridgeBinary() {
+		t.Errorf("bridge binary = %q, want %s", base, platformBridgeBinary())
 	}
 }
 
@@ -65,6 +86,16 @@ func TestLightEngineDir_IsSiblingOfAgentDir(t *testing.T) {
 	if lightEngineDir() == lightAppDataDir() {
 		t.Fatal("engine dir must not be the agent's own install dir")
 	}
+	if runtime.GOOS == "darwin" {
+		// Deliberately a CHILD on the Mac: the agent there is a single file
+		// (readyfleet-light) that is replaced in place, never a directory
+		// swap, so the sibling rule's reason does not apply, and keeping the
+		// engine under the agent's directory makes uninstall remove it too.
+		if filepath.Dir(lightEngineDir()) != lightAppDataDir() {
+			t.Errorf("engine dir %q should be directly under the agent dir %q", lightEngineDir(), lightAppDataDir())
+		}
+		return
+	}
 	if filepath.Dir(lightEngineDir()) != filepath.Dir(lightAppDataDir()) {
 		t.Errorf("engine dir %q and agent dir %q should be siblings",
 			lightEngineDir(), lightAppDataDir())
@@ -76,9 +107,18 @@ func TestLightEngineDir_IsSiblingOfAgentDir(t *testing.T) {
 // Windows one.
 func TestLightEngineDir_DevFallback(t *testing.T) {
 	t.Setenv("LocalAppData", "")
+	t.Setenv("XDG_DATA_HOME", "")
 
 	dir := lightEngineDir()
-	if filepath.IsAbs(dir) || strings.Contains(dir, `\`) {
+	if runtime.GOOS == "linux" {
+		if !filepath.IsAbs(dir) || !strings.HasSuffix(dir, filepath.Join(".local", "share", "solarbeam")) {
+			t.Errorf("Linux XDG fallback = %q", dir)
+		}
+	} else if runtime.GOOS == "darwin" {
+		if !filepath.IsAbs(dir) || !strings.HasSuffix(dir, filepath.Join("Library", "Application Support", "ReadyFleet", "solarbeam")) {
+			t.Errorf("macOS fallback = %q", dir)
+		}
+	} else if filepath.IsAbs(dir) || strings.Contains(dir, `\`) {
 		t.Errorf("dev fallback = %q, want a relative path", dir)
 	}
 }

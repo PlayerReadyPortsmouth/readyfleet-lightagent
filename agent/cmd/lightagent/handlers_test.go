@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/consent"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/trayicon"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/venuepolicy"
 	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
@@ -51,6 +54,45 @@ func makeShowNotificationEnv(t *testing.T, args proto.ShowNotificationArgs) prot
 	return env
 }
 
+func TestSendLightInventory_PublishesCurrentSolarbeamState(t *testing.T) {
+	original := collectLightInventoryFn
+	t.Cleanup(func() { collectLightInventoryFn = original })
+	collectLightInventoryFn = func(context.Context, string, *solarbeam.Manager) (proto.LightInventoryData, error) {
+		return proto.LightInventoryData{
+			OSFamily:         "linux",
+			AgentVersion:     "test",
+			SolarbeamVersion: "0.8.8",
+			SolarbeamStatus:  "running",
+		}, nil
+	}
+
+	correlationID := uuid.New()
+	var got []proto.Envelope
+	err := sendLightInventory(context.Background(), correlationID, func(_ context.Context, env proto.Envelope) error {
+		got = append(got, env)
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("sendLightInventory: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("sent %d envelopes, want 1", len(got))
+	}
+	if got[0].Type != proto.MsgInventory {
+		t.Fatalf("type = %q, want %q", got[0].Type, proto.MsgInventory)
+	}
+	if got[0].InReplyTo == nil || *got[0].InReplyTo != correlationID {
+		t.Fatalf("reply id = %v, want %s", got[0].InReplyTo, correlationID)
+	}
+	var inv proto.LightInventoryData
+	if err := got[0].DecodeData(&inv); err != nil {
+		t.Fatalf("decode inventory: %v", err)
+	}
+	if inv.SolarbeamStatus != "running" || inv.SolarbeamVersion != "0.8.8" {
+		t.Fatalf("solarbeam inventory = status %q version %q", inv.SolarbeamStatus, inv.SolarbeamVersion)
+	}
+}
+
 // collectResult runs a handler and returns the single MsgResult it sent.
 func collectResult(t *testing.T, run func(send func(ctx context.Context, env proto.Envelope) error)) proto.ResultData {
 	t.Helper()
@@ -81,7 +123,7 @@ func TestRunShowNotification_CallsNotifyWithDecodedFields(t *testing.T) {
 	})
 	notify := &recordingNotifier{}
 	res := collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), env, send, notify, &recordingPrompter{})
+		runShowNotification(context.Background(), env, send, notify, &recordingGate{}, nil)
 	})
 	if res.ExitCode != 0 {
 		t.Fatalf("exit=%d err=%s", res.ExitCode, res.Error)
@@ -109,7 +151,7 @@ func TestRunShowNotification_URLPresenceControlsOnClick(t *testing.T) {
 	})
 	notify := &recordingNotifier{}
 	collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), withURL, send, notify, &recordingPrompter{})
+		runShowNotification(context.Background(), withURL, send, notify, &recordingGate{}, nil)
 	})
 	notify.mu.Lock()
 	gotOnClick := notify.calls[0].onClick
@@ -123,7 +165,7 @@ func TestRunShowNotification_URLPresenceControlsOnClick(t *testing.T) {
 	})
 	notify2 := &recordingNotifier{}
 	collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), withoutURL, send, notify2, &recordingPrompter{})
+		runShowNotification(context.Background(), withoutURL, send, notify2, &recordingGate{}, nil)
 	})
 	notify2.mu.Lock()
 	gotOnClick2 := notify2.calls[0].onClick
@@ -143,7 +185,7 @@ func TestRunShowNotification_MissingFieldsRejectedBeforeNotify(t *testing.T) {
 		env := makeShowNotificationEnv(t, args)
 		notify := &recordingNotifier{}
 		res := collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-			runShowNotification(context.Background(), env, send, notify, &recordingPrompter{})
+			runShowNotification(context.Background(), env, send, notify, &recordingGate{}, nil)
 		})
 		if res.ExitCode == 0 {
 			t.Errorf("args %+v: expected non-zero exit for missing required field", args)
@@ -162,7 +204,7 @@ func TestRunShowNotification_NotifyErrorSurfacedVerbatim(t *testing.T) {
 	})
 	notify := &recordingNotifier{err: errors.New("trayicon: tray not running")}
 	res := collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), env, send, notify, &recordingPrompter{})
+		runShowNotification(context.Background(), env, send, notify, &recordingGate{}, nil)
 	})
 	if res.ExitCode == 0 {
 		t.Fatal("expected non-zero exit when Notify fails")
@@ -187,8 +229,6 @@ func TestSeverityFromWire(t *testing.T) {
 	}
 }
 
-
-
 // A connection request is a question, not a notice: a tray balloon fades
 // after a few seconds whether or not the mentor saw it, and a missed request
 // simply expires 30 minutes later with nobody knowing they were asked. So
@@ -201,10 +241,10 @@ func TestRunShowNotification_ConnectionRequestUsesThePersistentPrompt(t *testing
 		URL:   "https://readyapp.player-ready.co.uk/settings/solarbeam-devices?request=req-1",
 	})
 	notify := &recordingNotifier{}
-	prompt := &recordingPrompter{}
+	prompt := &recordingGate{}
 
 	res := collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), env, send, notify, prompt)
+		runShowNotification(context.Background(), env, send, notify, prompt, nil)
 	})
 	if res.ExitCode != 0 {
 		t.Fatalf("exit=%d err=%s", res.ExitCode, res.Error)
@@ -238,10 +278,10 @@ func TestRunShowNotification_OtherKindsStayBalloons(t *testing.T) {
 		Kind: "agent_updated", Title: "Updated", Body: "Now on 0.20.1",
 	})
 	notify := &recordingNotifier{}
-	prompt := &recordingPrompter{}
+	prompt := &recordingGate{}
 
 	collectResult(t, func(send func(context.Context, proto.Envelope) error) {
-		runShowNotification(context.Background(), env, send, notify, prompt)
+		runShowNotification(context.Background(), env, send, notify, prompt, nil)
 	})
 
 	notify.mu.Lock()
@@ -254,25 +294,64 @@ func TestRunShowNotification_OtherKindsStayBalloons(t *testing.T) {
 	}
 }
 
-// recordingPrompter stands in for the persistent connection-request dialog:
-// the real one blocks on a person and needs a window.
-type recordingPrompter struct {
-	mu     sync.Mutex
-	calls  []promptCall
-	answer bool
+// recordingGate stands in for the consent decision: the real one talks to
+// a desktop notification daemon or a TaskDialog and blocks on a person.
+type recordingGate struct {
+	mu      sync.Mutex
+	calls   []promptCall
+	outcome consent.Outcome
 }
 
-type promptCall struct{ title, body string }
+type promptCall struct{ title, body, requesterID string }
 
-func (p *recordingPrompter) Prompt(title, body string) bool {
+func (p *recordingGate) Decide(_ context.Context, req consent.Request) consent.Outcome {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.calls = append(p.calls, promptCall{title, body})
-	return p.answer
+	p.calls = append(p.calls, promptCall{req.Title, req.Body, req.RequesterID})
+	if p.outcome == "" {
+		return consent.OutcomeDeclined
+	}
+	return p.outcome
 }
 
-func (p *recordingPrompter) seen() []promptCall {
+func (p *recordingGate) seen() []promptCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]promptCall(nil), p.calls...)
+}
+
+// TestRunStartSolarbeam_CoreTeamNeedsApproval: on a Core Team venue the
+// light agent refuses a start the C2 did not mark approved, and refuses
+// every start while the venue policy is unknown, before touching the engine
+// (manager is nil here: reaching it would panic).
+func TestRunStartSolarbeam_CoreTeamNeedsApproval(t *testing.T) {
+	var core venuepolicy.State
+	core.Set(&proto.VenuePolicy{RequireConnectionApproval: true, ScreenMonitorLockedOff: true})
+	var unknown venuepolicy.State
+	cases := map[string]struct {
+		policy *venuepolicy.State
+		args   proto.SolarbeamStartArgs
+	}{
+		"core team, unapproved":                   {&core, proto.SolarbeamStartArgs{RequireConnectionApproval: true}},
+		"core team, approval without policy flag": {&core, proto.SolarbeamStartArgs{ConnectionApproved: true}},
+		"unknown policy":                          {&unknown, proto.SolarbeamStartArgs{RequireConnectionApproval: true, ConnectionApproved: true}},
+		"no policy":                               {nil, proto.SolarbeamStartArgs{}},
+		// Forged/insufficient owner markers: another requester, the wrong
+		// session type, or the marker on a policy-less connection.
+		"owner marker, other requester": {&core, proto.SolarbeamStartArgs{RequireConnectionApproval: true, RequesterIsOwner: true, SessionType: proto.SessionTypeOwnDevice, RequesterID: "someone-else"}},
+		"owner marker, cyp session":     {&core, proto.SolarbeamStartArgs{RequireConnectionApproval: true, RequesterIsOwner: true, RequesterID: "owner-oid"}},
+		"owner marker, unknown policy":  {&unknown, proto.SolarbeamStartArgs{RequireConnectionApproval: true, RequesterIsOwner: true, SessionType: proto.SessionTypeOwnDevice, RequesterID: "owner-oid"}},
+		"owner, no C2 marker":           {&core, proto.SolarbeamStartArgs{RequireConnectionApproval: true, SessionType: proto.SessionTypeOwnDevice, RequesterID: "owner-oid"}},
+	}
+	for name, tc := range cases {
+		tc.args.SessionID, tc.args.MachineID, tc.args.BundleToken = "s1", uuid.NewString(), "bt"
+		raw, _ := json.Marshal(tc.args)
+		env, _ := proto.NewEnvelope(proto.MsgCommand, uuid.New(), nil, proto.CommandData{Kind: proto.CmdStartSolarbeam, Args: raw})
+		var got proto.ResultData
+		send := func(_ context.Context, e proto.Envelope) error { return e.DecodeData(&got) }
+		runStartSolarbeam(context.Background(), env, send, nil, nil, tc.policy, "owner-oid")
+		if got.ExitCode == 0 || got.Error != "connection approval required or venue policy unavailable" {
+			t.Errorf("%s: result %+v, want refusal", name, got)
+		}
+	}
 }

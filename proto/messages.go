@@ -10,11 +10,23 @@
 package proto
 
 import (
+	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Server → Agent.
+const (
+	MsgComputeLease  MessageType = "compute_lease"
+	MsgComputeNoWork MessageType = "compute_no_work"
+	MsgComputeCancel MessageType = "compute_cancel"
 )
 
 // ProtocolVersion is the wire protocol version. The server advertises the
@@ -31,8 +43,15 @@ const (
 	MsgPong      MessageType = "pong"
 	MsgInventory MessageType = "inventory"
 	MsgTelemetry MessageType = "telemetry"
+	MsgOutput    MessageType = "output"
+	MsgResult    MessageType = "result"
 
-	MsgResult MessageType = "result"
+	MsgMachineEvents   MessageType = "machine_events"
+	MsgSecurityPosture MessageType = "security_posture"
+
+	// MsgConsentDecision reports how a desktop connection prompt ended
+	// (ConsentDecisionData).
+	MsgConsentDecision MessageType = "consent_decision"
 )
 
 // Server → Agent.
@@ -47,6 +66,19 @@ const (
 	MsgTerminalClose  MessageType = "terminal_close"
 	MsgScreenStart    MessageType = "screen_start"
 	MsgScreenStop     MessageType = "screen_stop"
+	// MsgViewingStarted / MsgViewingStopped tell a managed agent that staff
+	// are (no longer) watching this machine, so its user-session companion
+	// can show the "Staff are viewing this screen" bar. The server renews
+	// MsgViewingStarted while watched; the agent drops the bar if no renewal
+	// arrives within ViewingRenewTTL. Never carries who is watching.
+	MsgViewingStarted MessageType = "viewing_started"
+	MsgViewingStopped MessageType = "viewing_stopped"
+	// MsgOverrideDecision answers an agent's MsgOverrideRequest (staff
+	// override code entered at a blocked-software popup).
+	MsgOverrideDecision MessageType = "override_decision"
+	// MsgConsentDismiss closes an open desktop connection prompt because the
+	// owner already decided in ReadyApp (ConsentDismissData).
+	MsgConsentDismiss MessageType = "consent_dismiss"
 )
 
 // CommandKind enumerates the operations the server can ask an agent to run.
@@ -58,10 +90,20 @@ const (
 	CmdStartSolarbeam   CommandKind = "start_solarbeam"
 	CmdStopSolarbeam    CommandKind = "stop_solarbeam"
 
+	CmdSetSolarbeamAvailability CommandKind = "set_solarbeam_availability"
+
 	CmdUpdate CommandKind = "update"
 
 	CmdSolarbeamEngineUpdate CommandKind = "solarbeam_engine_update"
 	CmdShowNotification      CommandKind = "show_notification"
+)
+
+// OutputStream identifies which standard stream an [OutputData] chunk came
+// from.
+type OutputStream string
+
+const (
+	StreamStdout OutputStream = "stdout"
 )
 
 // Envelope wraps every message on the wire.
@@ -111,78 +153,43 @@ func (e Envelope) DecodeData(v any) error {
 // MachineID is informational; the authoritative identity is the CN of the
 // presented client certificate, which the server cross-checks.
 type HelloData struct {
-	ProtocolVersion   int    `json:"protocol_version"`
-	AgentVersion      string `json:"agent_version"`
-	MachineID         string `json:"machine_id"`
-	OS                string `json:"os"`
-	OSVersion         string `json:"os_version"`
-	InventoryChecksum string `json:"inventory_checksum,omitempty"`
+	VenuePolicySupported bool   `json:"venue_policy_supported,omitempty"`
+	ProtocolVersion      int    `json:"protocol_version"`
+	AgentVersion         string `json:"agent_version"`
+	MachineID            string `json:"machine_id"`
+	OS                   string `json:"os"`
+	OSVersion            string `json:"os_version"`
+	InventoryChecksum    string `json:"inventory_checksum,omitempty"`
+	// VenueApp is the ReadyApp Venue desktop app's state (proto/venueapp.go).
+	// Omitted by agents that do not report it yet.
+	VenueApp *VenueAppStatus `json:"venue_app,omitempty"`
+	// SACState is the Windows Smart App Control posture: "off", "on",
+	// "evaluation" or "unknown" (see SACState* and docs/sac-posture.md).
+	// Empty means an older agent that does not report it.
+	SACState string `json:"sac_state,omitempty"`
+	// SACCheckedAt is when SACState was read (RFC3339, UTC).
+	SACCheckedAt *time.Time `json:"sac_checked_at,omitempty"`
+	// SignedIn is the interactive session's account (see SignedInReport).
+	// nil = an older agent that does not report it.
+	SignedIn *SignedInReport `json:"signed_in,omitempty"`
 }
 
-// InventoryData is a full inventory snapshot. Sent on hello and in response
-// to a CmdInventoryRefresh.
-//
-// Fields are intentionally generous in scope so we don't have to revise the
-// envelope as new collectors land. Phase-3 fields (BootEntries) live in this
-// same struct to avoid a schema fork.
-type InventoryData struct {
-	Hostname            string         `json:"hostname"`
-	FQDN                string         `json:"fqdn,omitempty"`
-	OS                  OSInfo         `json:"os"`
-	Hardware            HardwareInfo   `json:"hardware"`
-	Network             NetworkInfo    `json:"network"`
-	InstalledSoftware   []SoftwareItem `json:"installed_software"`
-	BootEntries         []BootEntry    `json:"boot_entries,omitempty"`
-	HardwareFingerprint string         `json:"hardware_fingerprint,omitempty"`
-	CollectedAt         time.Time      `json:"collected_at"`
-	Checksum            string         `json:"checksum,omitempty"`
+// SignedInReport is who is signed in to the machine's interactive session
+// right now. Account name and logon time only: current value, no history,
+// never a credential. An empty User means nobody is signed in (for example
+// at the sign-in screen), which is distinct from a nil report.
+type SignedInReport struct {
+	User  string     `json:"user"`
+	Since *time.Time `json:"since,omitempty"`
 }
 
-type OSInfo struct {
-	Name        string    `json:"name"`
-	Version     string    `json:"version"`
-	Build       string    `json:"build,omitempty"`
-	InstallDate time.Time `json:"install_date,omitempty"`
-}
-
-type HardwareInfo struct {
-	CPUModel string     `json:"cpu_model"`
-	CPUCores int        `json:"cpu_cores"`
-	RAMBytes int64      `json:"ram_bytes"`
-	Disks    []DiskInfo `json:"disks"`
-}
-
-type DiskInfo struct {
-	Model     string `json:"model,omitempty"`
-	SizeBytes int64  `json:"size_bytes"`
-	FreeBytes int64  `json:"free_bytes,omitempty"`
-	Mount     string `json:"mount,omitempty"`
-}
-
-type NetworkInfo struct {
-	NICs      []NIC  `json:"nics"`
-	PrimaryIP string `json:"primary_ip,omitempty"`
-}
-
-type NIC struct {
-	Name    string   `json:"name"`
-	MAC     string   `json:"mac"`
-	IPs     []string `json:"ips"`
-	Gateway string   `json:"gateway,omitempty"`
-}
-
-type SoftwareItem struct {
-	Name        string    `json:"name"`
-	Version     string    `json:"version,omitempty"`
-	Publisher   string    `json:"publisher,omitempty"`
-	InstallDate time.Time `json:"install_date,omitempty"`
-}
-
-type BootEntry struct {
-	GUID        string `json:"guid"`
-	Description string `json:"description"`
-	IsDefault   bool   `json:"is_default"`
-}
+// Smart App Control states reported in HelloData.SACState.
+const (
+	SACStateOff        = "off"
+	SACStateOn         = "on"
+	SACStateEvaluation = "evaluation"
+	SACStateUnknown    = "unknown"
+)
 
 // TelemetryData is one point-in-time performance/thermal sample, pushed
 // unsolicited by the agent on a fixed cadence (see agent/internal/telemetry).
@@ -198,6 +205,40 @@ type TelemetryData struct {
 	Network       NetworkUsage `json:"network"`
 	GPUs          []GPUInfo    `json:"gpus,omitempty"`
 	Thermal       ThermalInfo  `json:"thermal,omitzero"`
+	// Processes is populated only for a sustained resource threshold event
+	// (top consumers by name, for diagnosing the slowdown). Command lines and
+	// window titles are never collected. This is NOT the activity-signal
+	// path: per-PC activity on venue PCs is Attended below (every managed
+	// venue PC) and, on staff devices only, MsgUsageSpans / MsgDomainHits
+	// (docs/security.md, "Activity signals on venue PCs").
+	Processes        []ProcessInfo `json:"processes,omitempty"`
+	ResourceTriggers []string      `json:"resource_triggers,omitempty"`
+	// SignedIn refreshes the hello's signed-in account on every sample, so a
+	// login or logout shows within one telemetry interval. nil = not reported.
+	SignedIn *SignedInReport `json:"signed_in,omitempty"`
+	// Attended is the console session's attended state on a managed Windows
+	// venue PC (derived by the service each sample from the signed-in account,
+	// the in-session helper's input-idle seconds and lock flag). nil = not
+	// reported (BYOD, light agent, Linux, older agents, kill switch off). The
+	// C2 accepts it only from machines passing the venue-PC predicate.
+	Attended *AttendedReport `json:"attended,omitempty"`
+}
+
+// AttendedReport carries no account name, program, window or input content:
+// a state, the seconds since the last input (capped) and the lock flag.
+type AttendedReport struct {
+	State       string `json:"state"`
+	IdleSeconds int    `json:"idle_seconds"`
+	Locked      bool   `json:"locked"`
+}
+
+// ProcessInfo identifies a top resource consumer at the instant a sustained
+// threshold fires. It intentionally carries no command line or window title.
+type ProcessInfo struct {
+	PID             uint32  `json:"pid"`
+	Name            string  `json:"name"`
+	CPUPercent      float64 `json:"cpu_percent"`
+	WorkingSetBytes int64   `json:"working_set_bytes"`
 }
 
 // DiskUsage is one logical disk's current usage and throughput. ReadBytesSec/
@@ -236,6 +277,14 @@ type ThermalInfo struct {
 	MotherboardTempC *float64 `json:"motherboard_temp_c,omitempty"`
 }
 
+// OutputData is one chunk of stdout or stderr from an in-flight command.
+// The Envelope's InReplyTo links it to the originating MsgCommand.
+type OutputData struct {
+	Stream    OutputStream `json:"stream"`
+	Chunk     string       `json:"chunk"`
+	Truncated bool         `json:"truncated,omitempty"`
+}
+
 // ResultData is the terminal message for a command.
 type ResultData struct {
 	ExitCode   int           `json:"exit_code"`
@@ -247,11 +296,44 @@ type ResultData struct {
 // HelloAckData carries any config the server wants the agent to honour for
 // this connection.
 type HelloAckData struct {
-	AcceptedProtocolVersion int       `json:"accepted_protocol_version"`
-	HeartbeatSeconds        int       `json:"heartbeat_seconds,omitempty"`
-	OutputChunkBytes        int       `json:"output_chunk_bytes,omitempty"`
-	NeedsInventory          bool      `json:"needs_inventory,omitempty"`
-	ServerTime              time.Time `json:"server_time"`
+	VenuePolicy             *VenuePolicy `json:"venue_policy,omitempty"`
+	AcceptedProtocolVersion int          `json:"accepted_protocol_version"`
+	HeartbeatSeconds        int          `json:"heartbeat_seconds,omitempty"`
+	OutputChunkBytes        int          `json:"output_chunk_bytes,omitempty"`
+	NeedsInventory          bool         `json:"needs_inventory,omitempty"`
+	ServerTime              time.Time    `json:"server_time"`
+	// SteamFamilyView carries the approved STEAM-02 key config (from the
+	// two-snapshot discovery flow) so the agent can observe Family View
+	// state locally. nil until an operator has approved a config; the
+	// agent reports the check "unknown" without it. Config changes reach
+	// agents on their next (re)connect.
+	SteamFamilyView *SteamFamilyViewConfig `json:"steam_family_view,omitempty"`
+}
+
+// VenuePolicy is server-authoritative and independent of the agent profile.
+// A missing policy is denied by new managed agents until a current C2 responds.
+type VenuePolicy struct {
+	RequireConnectionApproval bool `json:"require_connection_approval"`
+	ScreenMonitorLockedOff    bool `json:"screen_monitor_locked_off"`
+	// AssignedUser is the machine's assigned_user (id or email, lower-cased),
+	// for the own-device exemption. Empty when unassigned.
+	AssignedUser string `json:"assigned_user,omitempty"`
+}
+
+// SteamFamilyViewConfig is the approved STEAM-02 observation config: which
+// flattened localconfig.vdf keys encode Family View state and what their
+// values look like when the view is locked. Produced by diffing a
+// before/after snapshot pair, never hand-authored.
+type SteamFamilyViewConfig struct {
+	Keys []SteamFamilyViewKey `json:"keys"`
+}
+
+// SteamFamilyViewKey is one observed key: Path is the flattened VDF path
+// (segments joined with "/", as steam_snapshot emits), LockedValue the
+// value seen with Family View enabled and locked.
+type SteamFamilyViewKey struct {
+	Path        string `json:"path"`
+	LockedValue string `json:"locked_value"`
 }
 
 // CommandData is a server-issued command. Args is shaped per Kind; see the
@@ -273,19 +355,49 @@ func (c CommandData) DecodeArgs(v any) error {
 // agent needs to launch the bridge + engine for one session. BundleToken is the
 // single-use credential the bridge presents to ReadyApp's /venue/bundle.
 type SolarbeamStartArgs struct {
-	SessionID   string `json:"session_id"`
-	MachineID   string `json:"machine_id"`
-	ReadyappURL string `json:"readyapp_url"`
-	BundleToken string `json:"bundle_token"`
+	// SessionType is the ReadyApp session type ("cyp_session" when absent or
+	// unrecognised; see NormalizeSessionType).
+	SessionType string `json:"session_type,omitempty"`
+	// RequesterID and RequesterEmail are filled by the C2 from the
+	// authenticated caller, never from the request body.
+	RequesterID               string `json:"requester_id,omitempty"`
+	RequesterEmail            string `json:"requester_email,omitempty"`
+	RequireConnectionApproval bool   `json:"require_connection_approval,omitempty"`
+	ConnectionApproved        bool   `json:"connection_approved,omitempty"`
+	// RequesterIsOwner is set ONLY by the C2 (any caller-supplied value is
+	// overwritten) on an approval-required machine when the authenticated
+	// requester is the device's own person — the home laptop's assigned_user
+	// or the BYOD owner_actor_id — and the session is the own-device type.
+	// The agent then starts without a connection prompt (Aurora, 9 Nov 2026)
+	// after re-checking the requester against its own owner identity.
+	RequesterIsOwner bool   `json:"requester_is_owner,omitempty"`
+	SessionID        string `json:"session_id"`
+	MachineID        string `json:"machine_id"`
+	ReadyappURL      string `json:"readyapp_url"`
+	BundleToken      string `json:"bundle_token"`
+	// PrivacyMode asks the venue companion to blank the physical monitors while
+	// this session has a remote viewer. ReadyApp (the authority) only sets it
+	// after checking the flag, the venue setting and the agent version; an
+	// agent that predates it ignores the field. PrivacyLabel is the staff name
+	// to show ("First I."), built by ReadyApp from the staff record, never from
+	// a request body. PrivacyInput additionally asks for the local keyboard and
+	// mouse lock (staff-only session types; acted on only by agents that
+	// carry the input hook).
+	PrivacyMode  bool   `json:"privacy_mode,omitempty"`
+	PrivacyLabel string `json:"privacy_label,omitempty"`
+	PrivacyInput bool   `json:"privacy_input,omitempty"`
 }
 
 // StopSolarbeamArgs is the payload for CmdStopSolarbeam: it tears down the
 // session the agent set up for start_solarbeam — stops the service-managed
 // engine and the agent-launched bridge, and clears the per-session bridge.env.
-// SessionID identifies the session being torn down (for logging/audit; the
-// agent stops the single local engine/bridge regardless).
+// SessionID scopes teardown to the session this agent successfully started.
+// RequireEmpty is used only for automatic expiry: the host must confirm the
+// same bridge has continuously had no humans for at least fifteen minutes.
+// Missing/unknown evidence refuses cleanup; explicit operator stops omit it.
 type StopSolarbeamArgs struct {
-	SessionID string `json:"session_id"`
+	SessionID    string `json:"session_id"`
+	RequireEmpty bool   `json:"require_empty,omitempty"`
 }
 
 // UpdateArgs is the payload for CmdUpdate. The agent downloads the stable URL,
@@ -308,7 +420,13 @@ type UpdateArgs struct {
 	// the other.
 	AgentProfile      string `json:"agent_profile"`
 	SignerFingerprint string `json:"signer_fingerprint"`
-	ProductID         string `json:"product_id"`
+	// Signature is a base64-encoded detached Ed25519 signature over the exact
+	// downloaded artifact bytes. Windows releases continue to use
+	// Authenticode and may omit it; Linux releases require it in addition to
+	// SHA-256. SignerFingerprint identifies the pinned Ed25519 public key for
+	// those releases (SHA-256 of its raw 32-byte encoding).
+	Signature string `json:"signature,omitempty"`
+	ProductID string `json:"product_id"`
 }
 
 // SolarbeamEngineUpdateArgs is the payload for CmdSolarbeamEngineUpdate: a
@@ -326,21 +444,22 @@ type SolarbeamEngineUpdateArgs struct {
 	URL               string `json:"url"`
 	SHA256            string `json:"sha256"`
 	SignerFingerprint string `json:"signer_fingerprint"`
+	Signature         string `json:"signature,omitempty"`
 	ProductID         string `json:"product_id"`
 }
 
 // ShowNotificationArgs is the payload for CmdShowNotification: a native
-// OS-level notification (the light agent renders it as a Windows tray
-// balloon) shown on the machine itself, distinct from an in-app ReadyApp
-// notification. Kind is a deliberately open string identifying the
-// notification's purpose ("connection_request" today; future kinds like
+// OS-level notification (a Windows tray balloon, a Linux
+// org.freedesktop.Notifications message) shown on the machine itself,
+// distinct from an in-app ReadyApp notification. Kind is a deliberately
+// open string identifying the notification's purpose; future kinds like
 // "session_ending" or "update_available" reuse this same command/args
-// shape without a proto change) — the agent does not branch on Kind to
-// decide whether/how to render, only Severity affects presentation, so a
-// caller can introduce a new Kind without an agent release. URL, if set,
-// is informational only today (the agent does not yet act on it — no
-// click-to-open handler exists); carried so a future one can be added
-// without another args change.
+// shape without a proto change, and an unrecognised Kind renders as an
+// ordinary notice, so a caller can introduce one without an agent release.
+//
+// One Kind IS special-cased by the agent: "connection_request" is a
+// question, not a notice, and gets a prompt with Accept/Decline that waits
+// for a human — see agent/internal/consent.
 type ShowNotificationArgs struct {
 	Kind  string `json:"kind"`
 	Title string `json:"title"`
@@ -350,18 +469,127 @@ type ShowNotificationArgs struct {
 	// to "info" rather than erroring, so a forward-compatible server can
 	// send a severity an older agent doesn't know about without breaking it.
 	Severity string `json:"severity,omitempty"`
-	URL      string `json:"url,omitempty"`
+	// URL, if set, is opened on the machine when the person acts on the
+	// notification — clicking a tray balloon, or pressing Accept on a
+	// connection request.
+	URL string `json:"url,omitempty"`
+	// RequesterID identifies WHO is asking, for the kinds where that is a
+	// question. The agent compares it against the owner identity its own
+	// enrollment carried (agent config's owner_actor_id, from
+	// machines.owner_actor_id): a match means the device's own owner is
+	// connecting to their own machine, which is unattended access and is
+	// not prompted; anything else is put to the person at the keyboard.
+	//
+	// The CONTROLLER fills this from its authenticated service caller's
+	// actor id, never from the notify request body — the agent treats it
+	// as an attribution it can act on, so a caller must not be able to
+	// name itself the owner and skip the prompt. Empty means
+	// unattributed, which the agent reads as "not the owner" and prompts,
+	// the fail-closed direction.
+	RequesterID string `json:"requester_id,omitempty"`
+	// RequesterEmail is the same attribution by email (an assigned user may
+	// be recorded as either). Controller-filled, never from the body.
+	RequesterEmail string `json:"requester_email,omitempty"`
+	// RequestID is the ReadyApp connection request this prompt asks about.
+	// The agent reports the prompt outcome against it (MsgConsentDecision)
+	// and a MsgConsentDismiss names it to close the prompt.
+	RequestID string `json:"request_id,omitempty"`
+	// SessionType is the session type the request is for (see
+	// NormalizeSessionType). The assigned-user exemption applies to
+	// "staff_remote_own_device" only.
+	SessionType string `json:"session_type,omitempty"`
+}
+
+// Session types carried in start_solarbeam and connection requests.
+const (
+	SessionTypeCypSession = "cyp_session"
+	SessionTypeOwnDevice  = "staff_remote_own_device"
+)
+
+// NormalizeSessionType maps ReadyApp's value (any case) to a known type and
+// defaults everything else, including empty, to cyp_session: the stricter one.
+func NormalizeSessionType(s string) string {
+	if strings.EqualFold(strings.TrimSpace(s), SessionTypeOwnDevice) {
+		return SessionTypeOwnDevice
+	}
+	return SessionTypeCypSession
+}
+
+// Prompt outcomes reported by the agent. Anything that is not an answer
+// at the desk is no_answer, which ReadyApp must treat as declined.
+const (
+	ConsentAccepted = "accepted"
+	ConsentDeclined = "declined"
+	ConsentTimedOut = "timed_out"
+	ConsentNoAnswer = "no_answer"
+)
+
+// ConsentDecisionData is the agent's MsgConsentDecision payload.
+type ConsentDecisionData struct {
+	RequestID string `json:"request_id"`
+	Outcome   string `json:"outcome"`
+}
+
+// ConsentDismissData is the server's MsgConsentDismiss payload. Decision is
+// the owner's ReadyApp answer ("approved", "declined" or "cancelled"), shown
+// for context only: the agent just closes the prompt and opens nothing.
+type ConsentDismissData struct {
+	RequestID string `json:"request_id"`
+	Decision  string `json:"decision,omitempty"`
+}
+
+// Managed venue staff messages. On a MANAGED venue PC (a child's session)
+// show_notification is a one-way, plain-text staff message rendered by the
+// venue companion in the logged-in user's session — never by the SYSTEM
+// service. The agent refuses kind "connection_request" and any URL there,
+// and enforces these limits on the sanitised text (control and format
+// characters stripped) rather than truncating, so staff never have a
+// message silently cut. See agent/internal/staffmessage.
+const (
+	StaffMessageMaxTitleRunes = 80
+	StaffMessageMaxBodyRunes  = 300
+)
+
+// ShowNotificationReport codes. A managed agent writes one
+// ShowNotificationReport as JSON on stdout before its result, and prefixes
+// ResultData.Error with the same code ("no_session: …"), so a caller can map
+// the outcome without parsing prose. Exit code 0 means Code is
+// NotifyDisplayed; anything else is non-zero.
+const (
+	// NotifyDisplayed: the companion showed the message on screen and
+	// acknowledged it.
+	NotifyDisplayed = "displayed"
+	// NotifyRefused: the request is not allowed on this machine
+	// (a connection_request kind, or a URL, on a managed venue PC).
+	NotifyRefused = "refused"
+	// NotifyInvalid: missing or over-long title/body after sanitising.
+	NotifyInvalid = "invalid"
+	// NotifyNoSession: nobody can see it — no signed-in console session, no
+	// venue companion running in it, or the screen is locked.
+	NotifyNoSession = "no_session"
+	// NotifyNotDisplayed: the companion took the message but did not confirm
+	// it was shown (window failure, timeout, too many queued).
+	NotifyNotDisplayed = "not_displayed"
+)
+
+// ShowNotificationReport is the managed agent's structured outcome for
+// CmdShowNotification (stdout JSON). Via names the surfaces that showed it:
+// "banner" or "banner+tray" (a tray balloon alone is never counted as shown).
+type ShowNotificationReport struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
+	Via    string `json:"via,omitempty"`
 }
 
 // LightInventoryData is the minimal, privacy-safe inventory snapshot a
 // byod_solarbeam-profiled agent reports — deliberately a narrow subset of
-// InventoryData. Only these six fields may ever appear on the wire for a
+// InventoryData. Only these seven fields may ever appear on the wire for a
 // BYOD machine; the server-side ingestion path
 // (server/internal/dispatch/dispatch.go's HandleInventory BYOD branch)
 // strict-decodes this with json.Decoder.DisallowUnknownFields so an agent
 // sending hostname, username, network, or installed_software fails closed
 // rather than persisting personal data about someone's home PC.
-// TestLightInventoryData_ExactlySixFields (messages_test.go) guards this
+// TestLightInventoryData_ExactFieldList (messages_test.go) guards this
 // struct against silent drift — adding or renaming a field must touch
 // that test deliberately.
 type LightInventoryData struct {
@@ -371,4 +599,858 @@ type LightInventoryData struct {
 	AgentVersion     string `json:"agent_version"`
 	SolarbeamVersion string `json:"solarbeam_version,omitempty"`
 	SolarbeamStatus  string `json:"solarbeam_status,omitempty"`
+	// SolarbeamHost is the SolarBeam manager's own statement of whether this
+	// machine can host and what the host can do (the macOS light agent's
+	// HostAvailability, agent/internal/solarbeam/darwinhost.go). Optional:
+	// Windows and Linux light agents may omit it, and the C2 then assumes the
+	// pre-existing "always available, everything supported". No personal data:
+	// booleans and a short machine-generated reason.
+	SolarbeamHost *SolarbeamHostReport `json:"solarbeam_host,omitempty"`
+}
+
+// SolarbeamHostReport mirrors agent/internal/solarbeam.HostAvailability on
+// the wire, field for field, so the agent can hand its struct straight to the
+// inventory. Stored by the C2 as machines.solarbeam_host_report (migration
+// 074) and exposed to ReadyApp through the BYOD device DTO as a capability
+// token list (SolarbeamHostCapabilities.Tokens).
+type SolarbeamHostReport struct {
+	// Enabled is the local opt-in (config.json `solarbeam_host` on a Mac).
+	Enabled bool `json:"enabled"`
+	// Available is true when a start_solarbeam would be attempted now.
+	Available bool `json:"available"`
+	// Reason is empty when Available, else a short machine-generated cause
+	// (a missing permission, missing engine files, the opt-in being off).
+	Reason string `json:"reason,omitempty"`
+	// Capabilities is what the host can do; false means the viewer greys it
+	// out and the bridge refuses the message (capability honesty).
+	Capabilities SolarbeamHostCapabilities `json:"capabilities"`
+}
+
+// SolarbeamHostCapabilities mirrors agent/internal/solarbeam.HostCapabilities
+// field for field (same JSON names). Every field defaults to false, so an
+// agent that reports the struct advertises only what it sets.
+type SolarbeamHostCapabilities struct {
+	Gamepad          bool `json:"gamepad"`
+	PenTouch         bool `json:"pen_touch"`
+	HostAudioMode    bool `json:"host_audio_mode"`
+	Clipboard        bool `json:"clipboard"`
+	DisplayModes     bool `json:"display_modes"`
+	Consent          bool `json:"consent"`
+	PrivacyMode      bool `json:"privacy_mode"`
+	SessionIndicator bool `json:"session_indicator"`
+}
+
+// SolarbeamHostBaseTokens are what every SolarBeam host does through the
+// engine whenever it can host at all: picture, system audio, keyboard and
+// mouse. They are not fields of SolarbeamHostCapabilities because no manager
+// can switch them off individually; a host that cannot do these cannot host.
+var SolarbeamHostBaseTokens = []string{"video", "audio", "keyboard", "mouse"}
+
+// Tokens is the capability token list ReadyApp consumes
+// (apps/api/src/lib/solarbeamMacHost.ts, `solarbeam_host_capabilities` on
+// the BYOD device DTO): the base tokens, then one token per true field. The
+// mapping is the contract between this struct and ReadyApp's feature keys:
+//
+//	Gamepad          -> "gamepad"            (ReadyApp gamepad)
+//	PenTouch         -> "pen", "touch"       (ReadyApp penTouch)
+//	HostAudioMode    -> "host_audio"         (ReadyApp hostAudioMode)
+//	Clipboard        -> "clipboard"          (ReadyApp clipboard)
+//	DisplayModes     -> "display_modes"      (ReadyApp displayModes)
+//	Consent          -> "consent"            (ReadyApp consentPrompt)
+//	PrivacyMode      -> "privacy_mode"       (ReadyApp: carried, not yet a feature key)
+//	SessionIndicator -> "session_indicator"  (ReadyApp: carried, not yet a feature key)
+//
+// ReadyApp ignores tokens it does not know, so adding a field here is safe.
+func (c SolarbeamHostCapabilities) Tokens() []string {
+	out := append([]string(nil), SolarbeamHostBaseTokens...)
+	for _, f := range []struct {
+		on     bool
+		tokens []string
+	}{
+		{c.Gamepad, []string{"gamepad"}},
+		{c.PenTouch, []string{"pen", "touch"}},
+		{c.HostAudioMode, []string{"host_audio"}},
+		{c.Clipboard, []string{"clipboard"}},
+		{c.DisplayModes, []string{"display_modes"}},
+		{c.Consent, []string{"consent"}},
+		{c.PrivacyMode, []string{"privacy_mode"}},
+		{c.SessionIndicator, []string{"session_indicator"}},
+	} {
+		if f.on {
+			out = append(out, f.tokens...)
+		}
+	}
+	return out
+}
+
+// ViewingKind says which surface staff are watching through.
+const (
+	ViewingKindScreen    = "screen"
+	ViewingKindSolarBeam = "solarbeam"
+)
+
+// ViewingRenewTTL is how long one MsgViewingStarted keeps the bar up
+// without a renewal.
+const ViewingRenewTTL = 30 * time.Second
+
+// ViewingData (server→agent) is the MsgViewingStarted/MsgViewingStopped
+// payload. A count, never identities.
+type ViewingData struct {
+	WatcherCount int    `json:"watcher_count"`
+	Kind         string `json:"kind"`
+}
+
+// MachineEventsData is one collection batch from the agent's Windows
+// event-log + WER collector (design Phase 2). The agent ships a bounded,
+// allowlisted delta — the server classifies and stores; noise rules live
+// server-side so they change without an agent release.
+type MachineEventsData struct {
+	CollectedAt time.Time      `json:"collected_at"`
+	Events      []MachineEvent `json:"events,omitempty"`
+	WERReports  []WERReport    `json:"wer_reports,omitempty"`
+}
+
+// MachineEvent is one Windows event-log record. RecordID is the log's own
+// EventRecordID: monotonic per channel, it is both the agent's bookmark and
+// the server's dedupe key, so a re-sent batch (reconnect mid-ack) cannot
+// double-store.
+type MachineEvent struct {
+	Channel   string    `json:"channel"` // "System" | "Application"
+	RecordID  uint64    `json:"record_id"`
+	EventID   int       `json:"event_id"`
+	Provider  string    `json:"provider"`
+	Level     int       `json:"level"` // 1 crit, 2 err, 3 warn, 4 info
+	CreatedAt time.Time `json:"created_at"`
+	// Message is the rendered text, truncated agent-side (the server also
+	// enforces its own cap; both exist so neither trusts the other).
+	Message string `json:"message,omitempty"`
+}
+
+// WERReport is one Windows Error Reporting report folder. WER outlives the
+// circular event log by months and is the only place GPU watchdog resets
+// (LiveKernelEvent 0x193) appear at all — an event-log-only collector
+// scored 0/84 on the biggest crash class at Portsmouth. Folder names are
+// unique per report, so FolderName is the dedupe key.
+type WERReport struct {
+	// FolderName is the report directory name, e.g.
+	// "Kernel_193_00000000_e90e53a5-..." or "AppCrash_Propagation_Zero_...".
+	FolderName string    `json:"folder_name"`
+	CreatedAt  time.Time `json:"created_at"` // folder mtime
+	// DumpName is the contained dump file's name when present (e.g.
+	// "WATCHDOG-20260904-1003.dmp") — the subsystem prefix identifies the
+	// live-dump class. Contents are never shipped.
+	DumpName string `json:"dump_name,omitempty"`
+}
+
+// SecurityPostureData is the agent's periodic security posture sample
+// (Defender, firewall, Windows Update state). Collected every ~30 minutes;
+// the Windows Update search fields refresh on a slower cadence (the COM
+// search costs ~17s live) and carry their own timestamp.
+//
+// Pointer fields are nil when that probe failed or hasn't run yet — the
+// server stores what it got and the rules treat unknown as unknown, never
+// as healthy.
+type SecurityPostureData struct {
+	CollectedAt time.Time `json:"collected_at"`
+
+	// Defender (Get-MpComputerStatus).
+	DefenderEnabled  *bool      `json:"defender_enabled,omitempty"`   // AMServiceEnabled
+	RealTimeEnabled  *bool      `json:"real_time_enabled,omitempty"`  // RealTimeProtectionEnabled
+	TamperProtected  *bool      `json:"tamper_protected,omitempty"`   // IsTamperProtected
+	SignatureAgeDays *int       `json:"signature_age_days,omitempty"` // AntivirusSignatureAge
+	SignatureVersion string     `json:"signature_version,omitempty"`
+	LastQuickScanAt  *time.Time `json:"last_quick_scan_at,omitempty"`
+
+	// Firewall profile states (Get-NetFirewallProfile): name -> enabled.
+	FirewallProfiles map[string]bool `json:"firewall_profiles,omitempty"`
+
+	// Windows Update.
+	RebootPending     *bool      `json:"reboot_pending,omitempty"`
+	PendingUpdates    *int       `json:"pending_updates,omitempty"`
+	PendingSearchedAt *time.Time `json:"pending_searched_at,omitempty"`
+	LastInstallAt     *time.Time `json:"last_install_at,omitempty"`
+
+	// Wake-on-LAN readiness (the Windows-controlled half; the BIOS "power
+	// on by LAN" setting is not observable from the OS). Ready means: the
+	// active wired NIC accepts magic packets, it is armed as a wake device,
+	// and Fast Startup is off (hiberboot leaves many boards deaf to WoL
+	// from S5).
+	WolMagicPacket     *bool `json:"wol_magic_packet,omitempty"`
+	WolNicArmed        *bool `json:"wol_nic_armed,omitempty"`
+	FastStartupEnabled *bool `json:"fast_startup_enabled,omitempty"`
+
+	// SelfHeal records an automatic remediation the agent performed during
+	// this collection (currently only "signature_update" when the
+	// signatures were stale), with its outcome — so automation is always
+	// visible server-side, never silent.
+	SelfHeal []SelfHealAction `json:"self_heal,omitempty"`
+
+	// Steam is the Steam client posture sample (KCSIE layer-2 evidence:
+	// which accounts have signed in, auto-login state, client build age,
+	// Family View observation). nil when the collector did not run;
+	// Installed false when Steam is simply not on the machine.
+	Steam *SteamPostureData `json:"steam,omitempty"`
+
+	// Accounts is the local-account posture sample (ACCT-0x checks: the
+	// two-account model, admin group membership, autologon hygiene,
+	// password policy, interactive sessions). nil when the collector did
+	// not run (non-Windows, or a collector fault).
+	Accounts *AccountPostureData `json:"accounts,omitempty"`
+
+	// TimeSync is the clock / time-service observation. nil when the
+	// collector did not run (non-Windows, or a collector fault).
+	TimeSync *TimeSyncData `json:"time_sync,omitempty"`
+}
+
+// TimeSyncData is the machine's clock posture: whether the OS time service
+// is running and where it syncs from, plus how far the local clock actually
+// is from the C2's.
+//
+// Why this block exists: Portsmouth PC-7 (DESKTOP-29F3ENA) ran for weeks
+// with w32time STOPPED and its clock ~40s slow. Nothing observed it, and the
+// symptom surfaced somewhere else entirely — SolarBeam sessions failed
+// because the engine rejected session tokens whose `nbf` was still in the
+// future by the machine's reckoning. A clock is infrastructure for every
+// signature and token on the box, so it is posture, not trivia.
+//
+// The offset is measured against the C2 rather than an NTP server: the hello
+// handshake already carries ServerTime, so the agent gets a free reference
+// on every (re)connect with no extra network call and no dependency on
+// outbound UDP/123 being open. It is one-way, so it includes the ack's
+// network transit (single-digit to low-tens of milliseconds on these links)
+// — irrelevant against a 30-second alert threshold, and deliberately not
+// corrected for, because a round-trip correction would need a request
+// timestamp the protocol does not carry.
+type TimeSyncData struct {
+	// ServiceState is the time service's run state: "running", "stopped",
+	// "not_found", or "" when the probe failed (unknown, never assumed
+	// healthy).
+	ServiceState string `json:"service_state,omitempty"`
+	// ServiceStartType is "automatic", "manual", "disabled" or "" when
+	// unknown. Note that "manual" is the Windows default for w32time on a
+	// workgroup machine (it is trigger-started), so manual alone is not a
+	// fault — stopped or disabled is.
+	ServiceStartType string `json:"service_start_type,omitempty"`
+	// Source is the peer w32tm reports it is actually syncing from (e.g.
+	// "time.windows.com"), empty when the service is not running or the
+	// query failed.
+	Source string `json:"source,omitempty"`
+	// ConfiguredPeers is the configured NtpServer value from the registry,
+	// which is readable even when the service is stopped — the field that
+	// says whether a stopped service would have anywhere to sync to.
+	ConfiguredPeers string `json:"configured_peers,omitempty"`
+	// SyncType is the registry Type value: "NTP", "NT5DS", "NoSync",
+	// "AllSync". "NoSync" means the machine will never correct its clock.
+	SyncType string `json:"sync_type,omitempty"`
+	// LastSyncAt is the last successful sync w32tm reports; nil when
+	// unknown or never.
+	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
+
+	// OffsetSeconds is local_now - server_time observed at hello_ack
+	// receipt, signed (positive = this machine is AHEAD of the C2) and
+	// clamped to +/-24h so an unset RTC cannot poison the column. nil when
+	// no hello_ack has been observed on this connection yet.
+	OffsetSeconds *float64 `json:"offset_seconds,omitempty"`
+	// OffsetMeasuredAt is when that observation was taken (local clock, so
+	// it is itself subject to the offset — it exists to say "how stale",
+	// not to be an authoritative instant).
+	OffsetMeasuredAt *time.Time `json:"offset_measured_at,omitempty"`
+}
+
+// SteamPostureData is the read-only Steam client observation. Persona
+// names are deliberately never collected — accounts are identified by
+// SteamID64 only, everywhere (posture, alerts, UI).
+type SteamPostureData struct {
+	CollectedAt time.Time `json:"collected_at"`
+	Installed   bool      `json:"installed"`
+	// Accounts lists every login recorded in loginusers.vdf.
+	Accounts []SteamAccount `json:"accounts,omitempty"`
+	// ClientBuildAt is the Steam client build timestamp when the package
+	// manifest exposes one; nil = could not be determined (STEAM-06 then
+	// reports "unknown", never a guess). Source names what was read.
+	ClientBuildAt     *time.Time `json:"client_build_at,omitempty"`
+	ClientBuildSource string     `json:"client_build_source,omitempty"`
+	// CollectError carries a non-fatal collection problem (e.g. an
+	// unreadable loginusers.vdf on an installed client).
+	CollectError string `json:"collect_error,omitempty"`
+}
+
+// SteamAccount is one loginusers.vdf entry, keyed by SteamID64.
+type SteamAccount struct {
+	SteamID64        string     `json:"steam_id64"`
+	RememberPassword bool       `json:"remember_password"`
+	AllowAutoLogin   bool       `json:"allow_auto_login"`
+	MostRecent       bool       `json:"most_recent"`
+	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
+	// FamilyView is the STEAM-02 observation for this account:
+	// "locked", "unlocked", or "" (unknown — no approved config yet, or
+	// the configured keys were absent from localconfig.vdf).
+	FamilyView string `json:"family_view,omitempty"`
+}
+
+// SelfHealAction is one automatic remediation attempt.
+type SelfHealAction struct {
+	Action string `json:"action"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// AccountPostureData is the read-only local-account observation backing
+// the ACCT-0x checks. The agent ships raw facts; verdicts are computed on
+// the C2, which holds the machine's recorded CYP/admin SIDs and the vault
+// state. Passwords are never collected — the autologon observation is
+// booleans about WHERE a credential is stored, never the credential.
+type AccountPostureData struct {
+	CollectedAt time.Time `json:"collected_at"`
+	// Accounts lists every LOCAL account (enabled and disabled — ACCT-03
+	// needs to see that built-in Administrator/Guest exist and are off).
+	Accounts []LocalAccount `json:"accounts,omitempty"`
+	// AdminMemberSIDs is the Administrators group membership (all member
+	// SIDs, including domain/AzureAD ones the local user enum can't see).
+	AdminMemberSIDs []string `json:"admin_member_sids,omitempty"`
+	// PasswordPolicy is the machine's local account policy (ACCT-07).
+	PasswordPolicy *LocalPasswordPolicy `json:"password_policy,omitempty"`
+	// Autologon is the Winlogon autologon observation (ACCT-06).
+	Autologon *AutologonState `json:"autologon,omitempty"`
+	// Sessions lists current interactive sessions (console/RDP) with a
+	// resolved user SID — the C2 flags long-lived admin ones (ACCT-08).
+	Sessions []InteractiveSession `json:"sessions,omitempty"`
+	// CollectError carries a non-fatal collection problem; individual nil
+	// fields mean that probe failed (unknown), never "checked and fine".
+	CollectError string `json:"collect_error,omitempty"`
+}
+
+// LocalAccount is one local user account.
+type LocalAccount struct {
+	SID     string `json:"sid"`
+	Name    string `json:"name"`
+	RID     uint32 `json:"rid"`
+	Enabled bool   `json:"enabled"`
+	// PasswordAgeSeconds is how long ago the password was last set.
+	PasswordAgeSeconds *int64 `json:"password_age_seconds,omitempty"`
+	// CannotChangePassword mirrors UF_PASSWD_CANT_CHANGE (ACCT-01 wants it
+	// true on the CYP account).
+	CannotChangePassword bool `json:"cannot_change_password"`
+	PasswordNeverExpires bool `json:"password_never_expires"`
+}
+
+// LocalPasswordPolicy is the local account policy (NetUserModalsGet plus
+// the secedit ClearTextPassword line).
+type LocalPasswordPolicy struct {
+	MinPasswordLength int `json:"min_password_length"`
+	LockoutThreshold  int `json:"lockout_threshold"`
+	// ReversibleEncryption: nil = could not be determined (secedit export
+	// failed) — the C2 treats nil as unknown, never as pass.
+	ReversibleEncryption *bool `json:"reversible_encryption,omitempty"`
+}
+
+// AutologonState is the Winlogon autologon observation (ACCT-06). The
+// classic school-laptop mistake is a plaintext DefaultPassword value; its
+// PRESENCE is the fail state, and the value itself is never read into the
+// sample.
+type AutologonState struct {
+	Enabled bool `json:"enabled"`
+	// Username is Winlogon's DefaultUserName (correlated with the CYP
+	// account server-side).
+	Username string `json:"username,omitempty"`
+	// PlaintextPassword is true when a non-empty Winlogon DefaultPassword
+	// registry value exists.
+	PlaintextPassword bool `json:"plaintext_password"`
+}
+
+// InteractiveSession is one current console/RDP session.
+type InteractiveSession struct {
+	SID         string     `json:"sid"`
+	Username    string     `json:"username,omitempty"`
+	SessionType string     `json:"session_type"` // "console" or "rdp"
+	LogonAt     *time.Time `json:"logon_at,omitempty"`
+}
+
+// Controls: what the agent is asked to do with the list. Anything other than
+// these three — including "" — makes the agent do NOTHING (no Windows call at
+// all) and report the refusal: the 6 Sep 2026 incident rule that an
+// undecodable or unknown mode must never arm anything. An agent without the
+// enforce build refuses "enforce" and "off" the same way.
+const (
+	OperatingModeControlOff   = "off"
+	OperatingModeControlAudit = "audit"
+	// OperatingModeControlEnforce takes ownership of the list's startup
+	// routes. The C2 allows it only after a fresh, clean audit and an
+	// explicit, audited confirmation.
+	OperatingModeControlEnforce = "enforce"
+)
+
+// OperatingModeHeld is the pre-selection state at login: nothing on the
+// list starts. It is a state, not a configurable mode, so no list may
+// define a mode with this id.
+const OperatingModeHeld = "held"
+
+// OperatingModeProcess is one running process an item owns. Window is
+// "unknown" from the SYSTEM service (session 0 cannot see another session's
+// windows); the companion reports it from the user session in a later step.
+type OperatingModeProcess struct {
+	Name      string `json:"name"`
+	PID       uint32 `json:"pid"`
+	SessionID uint32 `json:"session_id"`
+	ImagePath string `json:"image_path,omitempty"`
+	Window    string `json:"window"`
+	// StartTime is the process creation time as a Windows FILETIME (100 ns
+	// intervals since 1601, 0 = unknown). With the PID, image and session it
+	// identifies the process, so a switch never acts on a PID reused since
+	// the snapshot.
+	StartTime uint64 `json:"start_time,omitempty"`
+}
+
+// OperatingModeBusy is the busy check. Busy is true when any finding is
+// present OR anything relevant is unknown: unknown activity is not evidence
+// of idle.
+type OperatingModeBusy struct {
+	Busy              bool                   `json:"busy"`
+	SolarBeamSession  bool                   `json:"solarbeam_session"`
+	SteamRunningAppID uint32                 `json:"steam_running_app_id,omitempty"`
+	BusyProcesses     []OperatingModeProcess `json:"busy_processes,omitempty"`
+	Findings          []string               `json:"findings,omitempty"`
+	Unknown           []string               `json:"unknown,omitempty"`
+}
+
+var (
+	operatingModeIDRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+)
+
+// reservedOperatingModeIDs may not name a configurable mode.
+var reservedOperatingModeIDs = map[string]bool{
+	OperatingModeHeld: true, OperatingModeControlOff: true, OperatingModeControlAudit: true,
+	OperatingModeControlEnforce: true, "none": true, "mixed": true, "unknown": true,
+}
+
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// The two modes the picker, its pipe route and a PIN request may name. A list
+// can define other mode ids; nothing a young person can reach asks for them.
+const (
+	OperatingModeAPClubs = "ap_clubs"
+	OperatingModeVR      = "vr"
+)
+
+// IsPickerOperatingMode reports whether mode is ap_clubs or vr.
+func IsPickerOperatingMode(mode string) bool {
+	return mode == OperatingModeAPClubs || mode == OperatingModeVR
+}
+
+// OperatingModePINDigits is the venue PIN length.
+const OperatingModePINDigits = 4
+
+// MsgOperatingModeGrantResponse codes. The first seven are the enforce
+// build's contract; the last three are the issuer's additions for requests
+// that never reach the PIN check.
+const (
+	OperatingModeGrantCodeWrongPIN  = "wrong_pin"
+	OperatingModeGrantCodeLockedOut = "locked_out"
+
+	OperatingModeGrantCodeNotEnforced = "not_enforced"
+
+	OperatingModeGrantCodeError = "error"
+	// Issuer additions.
+	OperatingModeGrantCodeInvalidRequest = "invalid_request"
+)
+
+// LogValue keeps slog (text and JSON handlers) from printing the PIN.
+func (d OperatingModeGrantRequestData) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("request_id", d.RequestID),
+		slog.String("target_mode", d.TargetMode),
+		slog.Int("list_revision", d.ListRevision),
+	)
+}
+
+// String and GoString keep fmt from printing the PIN.
+func (d OperatingModeGrantRequestData) String() string {
+	return fmt.Sprintf("{request_id:%s target_mode:%s list_revision:%d pin:[redacted]}", d.RequestID, d.TargetMode, d.ListRevision)
+}
+
+func (d OperatingModeGrantRequestData) GoString() string { return d.String() }
+
+// Venue PIN grant messages (implemented on the PIN / companion build; the
+// names and payloads are fixed here so both builds agree).
+const (
+	// MsgOperatingModeGrantRequest (agent -> C2): the companion picker asked
+	// for a mode with a venue PIN. The C2 checks the PIN (salted slow hash,
+	// 5 misses per venue+machine -> 10-minute lockout) and answers with
+	// MsgOperatingModeGrantResponse.
+	MsgOperatingModeGrantRequest MessageType = "operating_mode_grant_request"
+	// MsgOperatingModeGrantResponse (C2 -> agent) answers one grant request.
+	MsgOperatingModeGrantResponse MessageType = "operating_mode_grant_response"
+	// MsgOperatingModeTransitionReport (agent -> C2) reports a switch the
+	// agent ran for a LOCAL venue-PIN request (source local_pin). Payload:
+	// OperatingModeTransitionReport. Remote staff switches are not sent this
+	// way: their report already comes back as the transition command's result.
+	// The C2 records it in the same transitions history, deduplicated on
+	// grant_id, and also accepts the report again from
+	// OperatingModeEnforcementStatus.LastTransition in the next
+	// apply_operating_mode report, so a message lost while offline still lands.
+	MsgOperatingModeTransitionReport MessageType = "operating_mode_transition_report"
+)
+
+// Grant sources. Each must arrive by its own path (see the file comment).
+const (
+	OperatingModeGrantSourceLocalPIN    = "local_pin"
+	OperatingModeGrantSourceRemoteStaff = "remote_staff"
+)
+
+const (
+	// OperatingModeGrantMaxLifetime bounds expires_at - issued_at.
+	OperatingModeGrantMaxLifetime = 60 * time.Second
+	// OperatingModeGrantClockSkew is the tolerance between the C2's clock and
+	// the agent's when checking issued_at and expires_at.
+	OperatingModeGrantClockSkew = 30 * time.Second
+)
+
+// OperatingModeGrant is a one-use, short-lived authorisation for ONE switch
+// on ONE machine into ONE mode of ONE list revision. Issued by the C2 after a
+// venue PIN check (source local_pin) or an audited staff request (source
+// remote_staff).
+type OperatingModeGrant struct {
+	// GrantID is a UUID, unique per grant; the agent persists consumed ids.
+	GrantID   string `json:"grant_id"`
+	MachineID string `json:"machine_id"`
+	VenueID   string `json:"venue_id"`
+	// TargetMode is a mode id of the enforced list ("ap_clubs", "vr"). Never
+	// "held": holding needs no authorisation and is never requested.
+	TargetMode string `json:"target_mode"`
+	// ListRevision is the enforced list's revision the grant was issued
+	// against; a list edited since refuses the grant.
+	ListRevision int `json:"list_revision"`
+	// Nonce is 32-128 lower-case hex characters of fresh randomness.
+	Nonce     string    `json:"nonce"`
+	IssuedAt  time.Time `json:"issued_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Source    string    `json:"source"`
+	// Actor: who authorised it — "venue_pin" for a PIN switch, or the staff
+	// actor id (X-Fleet-Actor-Id) for a remote switch. Recorded, not trusted.
+	Actor string `json:"actor"`
+}
+
+// OperatingModeTransitionRequest is CmdOperatingModeTransition's args, and
+// what the agent's transition entry point takes for a local PIN switch.
+type OperatingModeTransitionRequest struct {
+	// RequestID correlates the picker / staff request with the report.
+	RequestID string              `json:"request_id"`
+	Grant     *OperatingModeGrant `json:"grant"`
+}
+
+// OperatingModeGrantRequestData is MsgOperatingModeGrantRequest's payload.
+type OperatingModeGrantRequestData struct {
+	RequestID    string `json:"request_id"`
+	TargetMode   string `json:"target_mode"`
+	PIN          string `json:"pin"`
+	ListRevision int    `json:"list_revision"`
+}
+
+// OperatingModeGrantResponseData is MsgOperatingModeGrantResponse's payload.
+type OperatingModeGrantResponseData struct {
+	RequestID string              `json:"request_id"`
+	Granted   bool                `json:"granted"`
+	Grant     *OperatingModeGrant `json:"grant,omitempty"`
+	// Code when refused: "wrong_pin", "locked_out", "no_pin_set",
+	// "not_enforced", "wrong_list_revision", "unknown_mode", "error".
+	Code              string     `json:"code,omitempty"`
+	Reason            string     `json:"reason,omitempty"`
+	AttemptsRemaining *int       `json:"attempts_remaining,omitempty"`
+	LockedUntil       *time.Time `json:"locked_until,omitempty"`
+}
+
+// Enforcement phases.
+const (
+	// OperatingModePhaseNone: nothing is owned (never enforced, or released).
+	OperatingModePhaseNone = "none"
+	// OperatingModePhaseAcquiring: taking ownership, journaled; resumes after
+	// a restart.
+	OperatingModePhaseAcquiring = "acquiring"
+	// OperatingModePhaseOwned: every route is owned and verified.
+	OperatingModePhaseOwned = "owned"
+	// OperatingModePhasePartial: some routes could not be owned yet (for
+	// example the CYP user is not signed in, so their Run values cannot be
+	// read). Switching is refused until every route is owned.
+	OperatingModePhasePartial = "partial"
+	// OperatingModePhaseReleasing: restoring originals, journaled.
+	OperatingModePhaseReleasing = "releasing"
+)
+
+// Transition outcomes.
+const (
+	OperatingModeOutcomeSwitched = "switched"
+
+	// OperatingModeOutcomeRefused: nothing was changed (bad grant, busy,
+	// not enforced...).
+	OperatingModeOutcomeRefused = "refused"
+	// OperatingModeOutcomeFailedHeld: the switch started and a step failed;
+	// the machine is held (nothing on the list starts by itself) and is NOT
+	// in either mode. Steps say what is still running.
+	OperatingModeOutcomeFailedHeld = "failed_held"
+)
+
+// OperatingModeEnforcementStatus is the agent's own view of enforcement,
+// reported on every apply_operating_mode and transition, and what the
+// companion shows.
+type OperatingModeEnforcementStatus struct {
+	Phase        string `json:"phase"`
+	ListID       int64  `json:"list_id,omitempty"`
+	ListRevision int    `json:"list_revision,omitempty"`
+	Revision     string `json:"revision,omitempty"`
+	VenueID      string `json:"venue_id,omitempty"`
+	// Current is a mode id only when the last switch into it verified; it is
+	// "held" at every boot and login, after a failed or interrupted switch,
+	// and while ownership is incomplete. Never a mode for a mixed state.
+	Current    string `json:"current"`
+	HeldReason string `json:"held_reason,omitempty"`
+	// Opened: items the service opened for the current (or last) mode and
+	// still believes running — what the next switch closes.
+	Opened []string `json:"opened,omitempty"`
+	// Routes: one per owned route, with the backed-up original.
+	Routes []OperatingModeOwnedRoute `json:"routes"`
+	// Pending: items not (yet) owned, "item: why".
+	Pending []string `json:"pending,omitempty"`
+	// Journal: "idle", or "in_progress" while an operation runs (a report
+	// never normally shows it), or "interrupted" when the last one was cut
+	// off and recovered to held.
+	Journal        string                         `json:"journal"`
+	LastTransition *OperatingModeTransitionReport `json:"last_transition,omitempty"`
+	// Drift lists routes an installer or updater re-added since ownership and
+	// the agent took back to held (an installer repair restoring a Startup
+	// shortcut, Steam re-adding its Run value). Detected at every boot and CYP
+	// login, not only the 6-hourly re-send. Bounded to the most recent events.
+	Drift []OperatingModeDriftEvent `json:"drift,omitempty"`
+	// LastRecheckAt / LastRecheckReason ("startup", "login", "unlock") record
+	// the last ownership re-check. The companion picker must not offer a mode
+	// for a session until LastRecheckAt is at or after that session's logon.
+	LastRecheckAt     time.Time `json:"last_recheck_at,omitempty"`
+	LastRecheckReason string    `json:"last_recheck_reason,omitempty"`
+	Errors            []string  `json:"errors,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// OperatingModeDriftEvent is one re-added startup route the agent took back to
+// held. The recorded original is NEVER overwritten by a re-add — drift is
+// surfaced for review, and the backup stays the value approved at enforce time.
+type OperatingModeDriftEvent struct {
+	ItemID string    `json:"item_id"`
+	Route  string    `json:"route"`
+	Detail string    `json:"detail"`
+	At     time.Time `json:"at"`
+	// TookBack is true when the agent re-held the route; false when it detected
+	// drift but could not re-hold it (surfaced, not hidden).
+	TookBack bool `json:"took_back"`
+}
+
+// OperatingModeOwnedRoute is one route the agent owns.
+type OperatingModeOwnedRoute struct {
+	ItemID string `json:"item_id"`
+	Kind   string `json:"kind"`
+	Route  string `json:"route"`
+	// Original is a display summary of the backed-up value.
+	Original string `json:"original"`
+	// Held is the value the route is held at.
+	Held string `json:"held"`
+	// BackupSHA256 fingerprints the backup file, so a review can confirm the
+	// backup it approved is the one restored.
+	BackupSHA256 string    `json:"backup_sha256"`
+	CapturedAt   time.Time `json:"captured_at"`
+	Verified     bool      `json:"verified"`
+	// ReAdded counts times a route was found re-enabled (an updater re-added
+	// a Run value, an installer repair set a service back to Auto) and held
+	// again. The original backup is never overwritten by a re-add.
+	ReAdded int    `json:"re_added,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// OperatingModeTransitionReport is operating_mode_transition's stdout, and
+// the result of a local PIN switch.
+type OperatingModeTransitionReport struct {
+	RequestID string `json:"request_id"`
+	GrantID   string `json:"grant_id,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Actor     string `json:"actor,omitempty"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Outcome   string `json:"outcome"`
+	// Code is a machine-readable refusal or failure reason:
+	// "decode", "grant_invalid", "wrong_machine", "wrong_venue",
+	// "wrong_list_revision", "unknown_mode", "wrong_source", "not_yet_valid",
+	// "expired", "replayed", "not_enforced", "ownership_incomplete",
+	// "no_cyp_session", "busy", "step_failed", "store".
+	Code       string                              `json:"code,omitempty"`
+	Reason     string                              `json:"reason,omitempty"`
+	Steps      []OperatingModeTransitionStepResult `json:"steps"`
+	Busy       *OperatingModeBusy                  `json:"busy,omitempty"`
+	StartedAt  time.Time                           `json:"started_at"`
+	FinishedAt time.Time                           `json:"finished_at"`
+}
+
+// OperatingModeTransitionStepResult is one executed step. Action is "close",
+// "verify_closed", "open" or "verify_open"; Result "ok", "skipped" or
+// "failed".
+type OperatingModeTransitionStepResult struct {
+	ItemID string   `json:"item_id"`
+	Action string   `json:"action"`
+	Result string   `json:"result"`
+	Detail string   `json:"detail,omitempty"`
+	PIDs   []uint32 `json:"pids,omitempty"`
+}
+
+var operatingModeNonceRe = regexp.MustCompile(`^[0-9a-f]{32,128}$`)
+
+// OperatingModeGrantError is a refused grant with a report Code.
+type OperatingModeGrantError struct {
+	Code   string
+	Reason string
+}
+
+func (e *OperatingModeGrantError) Error() string { return e.Reason }
+
+func grantErr(code, format string, v ...any) error {
+	return &OperatingModeGrantError{Code: code, Reason: fmt.Sprintf(format, v...)}
+}
+
+func canonicalUUID(s string) bool {
+	u, err := uuid.Parse(s)
+	return err == nil && u != uuid.Nil && u.String() == s
+}
+
+// ValidateOperatingModeGrant checks a grant's shape alone (no clock, no
+// machine). Errors are *OperatingModeGrantError with Code "grant_invalid".
+func ValidateOperatingModeGrant(g *OperatingModeGrant) error {
+	bad := func(format string, v ...any) error { return grantErr("grant_invalid", format, v...) }
+	switch {
+	case g == nil:
+		return bad("the request carries no grant")
+	case !canonicalUUID(g.GrantID):
+		return bad("grant_id must be a lower-case UUID")
+	case !canonicalUUID(g.MachineID):
+		return bad("machine_id must be a lower-case UUID")
+	case !canonicalUUID(g.VenueID):
+		return bad("venue_id must be a lower-case UUID")
+	case !operatingModeIDRe.MatchString(g.TargetMode) || reservedOperatingModeIDs[g.TargetMode]:
+		return bad("target_mode %q is not a selectable mode id", g.TargetMode)
+	case g.ListRevision < 1:
+		return bad("list_revision must be at least 1")
+	case !operatingModeNonceRe.MatchString(g.Nonce):
+		return bad("nonce must be 32-128 lower-case hex characters")
+	case g.IssuedAt.IsZero() || g.ExpiresAt.IsZero():
+		return bad("issued_at and expires_at are required")
+	case !g.ExpiresAt.After(g.IssuedAt):
+		return bad("expires_at must be after issued_at")
+	case g.ExpiresAt.Sub(g.IssuedAt) > OperatingModeGrantMaxLifetime:
+		return bad("a grant may live at most %s", OperatingModeGrantMaxLifetime)
+	case g.Source != OperatingModeGrantSourceLocalPIN && g.Source != OperatingModeGrantSourceRemoteStaff:
+		return bad("source must be local_pin or remote_staff")
+	case strings.TrimSpace(g.Actor) == "" || len(g.Actor) > 200 || hasControlChars(g.Actor):
+		return bad("actor must be 1-200 characters with no control characters")
+	}
+	return nil
+}
+
+// OperatingModeGrantExpectation is what the receiving agent knows.
+type OperatingModeGrantExpectation struct {
+	MachineID    string
+	VenueID      string
+	ListRevision int
+	// Modes are the enforced list's mode ids.
+	Modes []string
+	// Source is the arrival path's source (see the file comment).
+	Source string
+	Now    time.Time
+}
+
+// CheckOperatingModeGrant validates the shape and binds the grant to the
+// receiving machine, venue, list revision, mode set, arrival path and clock.
+// It does NOT check replay; the agent's consumed-grant store does.
+func CheckOperatingModeGrant(g *OperatingModeGrant, want OperatingModeGrantExpectation) error {
+	if err := ValidateOperatingModeGrant(g); err != nil {
+		return err
+	}
+	if want.MachineID == "" || !strings.EqualFold(g.MachineID, want.MachineID) {
+		return grantErr("wrong_machine", "the grant is for a different machine")
+	}
+	if want.VenueID == "" || !strings.EqualFold(g.VenueID, want.VenueID) {
+		return grantErr("wrong_venue", "the grant is for a different venue than the enforced list")
+	}
+	if g.ListRevision != want.ListRevision {
+		return grantErr("wrong_list_revision", "the grant is for list revision %d; this machine enforces revision %d", g.ListRevision, want.ListRevision)
+	}
+	known := false
+	for _, m := range want.Modes {
+		if m == g.TargetMode {
+			known = true
+		}
+	}
+	if !known {
+		return grantErr("unknown_mode", "mode %q is not on the enforced list", g.TargetMode)
+	}
+	if g.Source != want.Source {
+		return grantErr("wrong_source", "a %s grant cannot arrive as a %s request", g.Source, want.Source)
+	}
+	if g.IssuedAt.After(want.Now.Add(OperatingModeGrantClockSkew)) {
+		return grantErr("not_yet_valid", "the grant was issued in the future (clocks differ by more than %s)", OperatingModeGrantClockSkew)
+	}
+	if want.Now.After(g.ExpiresAt.Add(OperatingModeGrantClockSkew)) {
+		return grantErr("expired", "the grant expired at %s", g.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// SetSolarbeamAvailabilityArgs changes hosting only, never Fleet transport.
+// Enabled is required even when false; reject permissive defaults at every hop.
+type SetSolarbeamAvailabilityArgs struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (a *SetSolarbeamAvailabilityArgs) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Enabled *bool `json:"enabled"`
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&wire); err != nil {
+		return fmt.Errorf("set_solarbeam_availability: %w", err)
+	}
+	if wire.Enabled == nil {
+		return fmt.Errorf("set_solarbeam_availability: enabled boolean is required")
+	}
+	a.Enabled = *wire.Enabled
+	return nil
+}
+
+// VenueAppInstallState is what the agent reports about the app on its machine.
+type VenueAppInstallState string
+
+const (
+	VenueAppNotInstalled VenueAppInstallState = "not_installed"
+	VenueAppPending      VenueAppInstallState = "pending"
+	VenueAppInstalled    VenueAppInstallState = "installed"
+	VenueAppFailed       VenueAppInstallState = "failed"
+)
+
+// Valid reports whether s is one of the four known states.
+func (s VenueAppInstallState) Valid() bool {
+	switch s {
+	case VenueAppNotInstalled, VenueAppPending, VenueAppInstalled, VenueAppFailed:
+		return true
+	}
+	return false
+}
+
+// VenueAppStatus is the agent's report, carried on hello. Nil (older agents,
+// and every agent until the release that fills it) leaves the stored values
+// untouched, so ReadyApp keeps showing "Not reported".
+type VenueAppStatus struct {
+	InstallState   VenueAppInstallState `json:"install_state"`
+	Version        string               `json:"version,omitempty"`
+	LastLaunchedAt *time.Time           `json:"last_launched_at,omitempty"`
 }

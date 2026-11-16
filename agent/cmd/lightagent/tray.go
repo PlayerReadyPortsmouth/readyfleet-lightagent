@@ -4,11 +4,13 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
 
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/companionadapter"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/hiddenbrowser"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/transport"
@@ -25,6 +27,7 @@ const (
 	trayMenuIDToggleConn    = 100
 	trayMenuIDQuit          = 101
 	trayMenuIDHiddenBrowser = 102
+	trayMenuIDControls      = 103
 )
 
 // newLightTray stages the tray's icon assets and constructs the
@@ -44,7 +47,7 @@ func newLightTray() (tray *trayicon.Tray, connectedIconPath, offlineIconPath str
 // logged, not fatal — a tray icon failing to render must never take the
 // real agent connection down with it, so this never returns an error to
 // its caller. tray must be one built by newLightTray, not yet run.
-func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, offlineIconPath string, client *transport.Client, solarbeamMgr *solarbeam.Manager) {
+func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, offlineIconPath string, client *transport.Client, solarbeamMgr *solarbeam.Manager, machineID string) {
 	var paused atomic.Bool
 	launcher := hiddenbrowser.NewLauncher(
 		tray,
@@ -52,12 +55,21 @@ func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, of
 		connectedIconPath, // same staged .ico the tray itself uses — see hiddenbrowser.Launcher's doc comment
 	)
 
+	// Windows only (nil elsewhere): the owner's opt-in "Install gamepad
+	// support…" entry. See gamepad_windows.go.
+	gamepads := newGamepadSupport(solarbeamMgr, slog.Default())
+
+	openControls, hasControls := runLightCompanion(ctx, machineID, client, solarbeamMgr, companionadapter.OpenReadyAppURL, tray)
+	if hasControls {
+		tray.OnActivate = openControls
+	}
+
 	menuItems := func() []trayicon.MenuItem {
 		toggleLabel := "Disconnect"
 		if paused.Load() {
 			toggleLabel = "Reconnect"
 		}
-		return []trayicon.MenuItem{
+		items := []trayicon.MenuItem{
 			{ID: trayMenuIDToggleConn, Label: toggleLabel, OnClick: func() {
 				next := !paused.Load()
 				paused.Store(next)
@@ -66,11 +78,21 @@ func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, of
 			{ID: trayMenuIDHiddenBrowser, Label: "Open hidden ReadyApp", OnClick: func() {
 				_ = launcher.Open()
 			}},
+		}
+		if gp := gamepads.menuItems(); len(gp) > 0 {
+			items = append(items, trayicon.MenuItem{Separator: true})
+			items = append(items, gp...)
+		}
+		items = append(items, []trayicon.MenuItem{
 			{Separator: true},
 			{ID: trayMenuIDQuit, Label: "Quit ReadyFleet Light Agent", OnClick: func() {
 				tray.Quit()
 			}},
+		}...)
+		if hasControls {
+			items = append([]trayicon.MenuItem{{ID: trayMenuIDControls, Label: "ReadyFleet controls", OnClick: openControls}}, items...)
 		}
+		return items
 	}
 
 	go func() {
@@ -83,7 +105,7 @@ func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, of
 				return
 			case <-ticker.C:
 				stats := client.Stats()
-				tray.SetTooltip(trayTooltip(stats, solarbeamMgr.Status(ctx)))
+				tray.SetTooltip(trayTooltip(stats, solarbeamMgr.Status(ctx), gamepads.tooltipLine()))
 				tray.SetMenuItems(menuItems())
 				if stats.Connected != lastConnected && connectedIconPath != "" && offlineIconPath != "" {
 					lastConnected = stats.Connected
@@ -100,7 +122,7 @@ func runTrayIcon(ctx context.Context, tray *trayicon.Tray, connectedIconPath, of
 	_ = tray.Run(ctx, menuItems())
 }
 
-func trayTooltip(stats transport.Stats, sb solarbeam.Status) string {
+func trayTooltip(stats transport.Stats, sb solarbeam.Status, gamepadLine string) string {
 	connLine := "Not connected"
 	if stats.Connected {
 		connLine = "Connected"
@@ -112,7 +134,11 @@ func trayTooltip(stats transport.Stats, sb solarbeam.Status) string {
 			sbLine += " (v" + sb.EngineVersion + ")"
 		}
 	}
-	return fmt.Sprintf("ReadyFleet Light Agent v%s\n%s\n%s", agentVersion, connLine, sbLine)
+	tip := fmt.Sprintf("ReadyFleet Light Agent v%s\n%s\n%s", agentVersion, connLine, sbLine)
+	if gamepadLine != "" {
+		tip += "\n" + gamepadLine
+	}
+	return tip
 }
 
 // writeTrayIcons stages the embedded tray .ico assets to disk once —

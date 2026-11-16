@@ -9,7 +9,8 @@ typed into it directly, so it cannot drift from the agent you are running.
 
 ## What it can do
 
-Six commands, listed in [CONTRACT.md](CONTRACT.md). That is the whole surface.
+The accepted commands are listed in [CONTRACT.md](CONTRACT.md), generated from
+the source. The light installer is included so enrolment is auditable too.
 
 Build and test it yourself — this is a Go workspace, so the paths are explicit:
 
@@ -25,8 +26,16 @@ if it contains the tells of any of those capabilities:
 
     go test ./agent/... ./proto/...
 
-The wire protocol here is pruned to what this agent references: 55
-declarations kept, 41 belonging to the separate managed-venue fleet removed.
+Runtime source files are copied verbatim. Two test-only adaptations are made:
+the shared staff-message test's rejected shell fixture uses the same typed wire
+literal instead of exporting the managed command constant; the companion
+browser source-wiring test retains its BYOD assertion and omits only the
+assertion reading the separate managed venue executable. All other assertions,
+including the binary capability checks, remain.
+Safe protocol data referenced by these tests is retained too.
+
+The wire protocol here is pruned to what this agent and its tests reference: 168
+declarations kept, 426 belonging to the separate managed-venue fleet removed.
 Their absence is deliberate and is itself part of the guarantee.
 
 ## Verify what you were given
@@ -59,30 +68,36 @@ So the guarantee is this instead:
   Explorer and confirm the signer thumbprint matches. Either mismatching means
   the download was tampered with in transit — stop and don't run it.
 
-## A known gap in the pruning
+## Privacy-safe inventory
 
-Six commands is the real surface (above) — but `proto/messages.go` here also
-declares several managed-fleet DATA shapes (`HardwareInfo`, `DiskInfo`,
-`NetworkInfo`, `TelemetryData`, `GPUInfo`, `ThermalInfo`) that this agent never
-populates. Not a leaked capability — the forbidden-symbol check that generates
-this repository would refuse to publish one of those — but worth being
-straight about rather than leaving unexplained.
-
-Why they're here: this agent and the managed one share a config struct
-(`internal/runtime.Config`), and that struct declares hooks for both. This
-agent's own inventory hook is a permanent stub:
-
-    InventoryProvider: func(ctx context.Context) (proto.InventoryData, error) {
-        return proto.InventoryData{}, nil
-    },
-
-— see `cmd/lightagent/main.go` — and never sets the telemetry hook at all. The
-struct field's TYPE still has to be declared for the shared code to compile,
-which is what pulls the shape declarations in. No instance of this agent has
-ever sent one populated.
+The light agent reports its OS family/version, CPU/GPU model, agent and engine
+versions, and SolarBeam availability. Unlike the August snapshot's stub, its
+current `lightInventoryProvider` supplies that limited snapshot; it does
+not enable managed hardware or telemetry collection. Shared protocol DATA
+shapes can still appear because Go must compile shared types. They do not
+add a command handler. The command contract and safety tests are the boundary.
 
 ## How it runs
 
-Current user only, from your own `%LocalAppData%` — no administrator
-rights at any point, and no Windows service. It starts when you log in and
-connects outbound only.
+Windows runs from your own `%LocalAppData%` and starts at login,
+without a Windows service. Linux runs as your desktop user under a systemd
+user unit, with SolarBeam under `$XDG_DATA_HOME/solarbeam`. Its setup
+scripts ask for sudo only for host input integration and distribution packages.
+The agent itself does not run as root. Pause/availability and connection-consent
+controls remain in the agent; owner self-connect does not bypass pause.
+
+Linux prebuilt bundles are signed with Ed25519. Compare the download's SHA-256
+to `x-artifact-sha256` from the release endpoint, and verify the detached
+signature with [linux-release-public.pem](linux-release-public.pem), whose raw
+Ed25519 public-key SHA-256 is
+`5961b14ed61f81602d7a48e65884bd3f20e4bb9dde2e4a2a6cefb61a29800c0a`.
+The key was matched to the committed release pin and the existing public Linux
+agent download; no private key is present. For an artifact with its detached
+signature alongside it:
+
+    openssl pkeyutl -verify -rawin -pubin -inkey linux-release-public.pem -sigfile artifact.sig -in artifact
+
+Native package recipes live in ReadyFleet `packaging/linux`; they wrap that same payload.
+
+This snapshot includes the macOS source paths reached by the same agent as
+well; publishing this source does not publish a signed installer for any OS.

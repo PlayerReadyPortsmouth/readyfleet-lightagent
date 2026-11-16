@@ -25,12 +25,13 @@ import (
 
 const maxPayloadBytes = 16 * 1024
 
-// lightTokenPattern matches an rft_ single-use enrollment token — the
-// same shape the managed installer requires, minted for a byod_solarbeam
-// enrollment token specifically (server-side, the token's own stored
-// agent_profile decides what the redeemed machine becomes; this pattern
-// only validates the wire shape, not the profile).
-var lightTokenPattern = regexp.MustCompile(`^rft_[A-Za-z0-9_-]{43}$`)
+// lightTokenPattern matches the two bearers a light install may redeem:
+// an rft_ single-use enrollment token (the per-person composed download),
+// or an rfc_ pairing code (the unified installer; 9 characters from the
+// pairing alphabet, any tier on the wire — the C2 resolves it to the
+// byod_solarbeam token it wraps). Only the wire shape is validated here;
+// the server's stored credential decides the profile.
+var lightTokenPattern = regexp.MustCompile(`^(rft_[A-Za-z0-9_-]{43}|rfc_[A-HJ-NP-Z2-9]{9})$`)
 
 // Payload is the complete on-disk enrollment schema for a light install.
 // Deliberately one field — unlike the managed payload's
