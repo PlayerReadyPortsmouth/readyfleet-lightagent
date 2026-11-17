@@ -5,29 +5,31 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/verify"
 )
 
-// applyLightUpdate is the light entrypoint's update.Manager.ApplyFn.
-//
-// PROVISIONAL for this increment, explicitly by design decision (see
-// docs/superpowers/plans/2026-07-26-solarbeam-byod-light-agent.md Task 6,
-// not yet built): the lightagent runs as a current-user process launched
-// from an HKCU Run key, not a service, so there is no service to
-// stop/restart the way the managed agent's apply does. This swaps the
-// binary file in place, verifies it, then exits — relying on the next
-// logon to relaunch under the new binary via that same Run key entry. No
-// self-heal-on-failed-restart dance (the managed apply's updater .bat)
-// exists yet; if the new binary fails to start, the machine simply stays
-// down until Task 6 lands a real relaunch/rollback story. Flagged here
-// rather than silently decided.
+// applyLightUpdate verifies and swaps the user-owned binary, then starts the
+// replacement's local helper before the delayed exit. The helper waits for this
+// exact process to exit, relaunches in the same desktop session and retains the
+// old binary until the replacement survives its startup window.
 func applyLightUpdate(downloadedPath, version, signerFingerprint string) error {
 	exePath, err := resolveExePath()
 	if err != nil {
 		return err
 	}
+
+	lease, err := acquireLightUpdateLease(exePath)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(lease)
 
 	// Personal PCs never trust ReadyFleet's private signing root (see
 	// lightinstall.verifyBundledAgent), so the chain-to-trusted-root check
@@ -50,11 +52,26 @@ func applyLightUpdate(downloadedPath, version, signerFingerprint string) error {
 		return fmt.Errorf("move new exe into place: %w", err)
 	}
 
-	// No self-heal: unlike the managed agent's updater .bat, there is no
-	// verification here that the new binary actually starts successfully
-	// before committing to it. Acceptable for this provisional path (see
-	// doc comment above) — a real answer is Task 6's job.
-	_ = os.Remove(oldPath)
+	// Start before exiting so a launch failure can still restore the current
+	// agent synchronously and return a failed command result to the controller.
+	parent, err := windows.OpenProcess(windows.SYNCHRONIZE, true, uint32(os.Getpid()))
+	if err != nil {
+		if restoreErr := restoreLightUpdate(exePath, oldPath, downloadedPath); restoreErr != nil {
+			return fmt.Errorf("retain updating process: %v; restore: %w", err, restoreErr)
+		}
+		return fmt.Errorf("retain updating process: %w", err)
+	}
+	defer windows.CloseHandle(parent)
+	args := append([]string{lightUpdateHelper, strconv.FormatUint(uint64(parent), 10), strconv.FormatUint(uint64(lease), 10)}, os.Args[1:]...)
+	helper := exec.Command(exePath, args...)
+	helper.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, AdditionalInheritedHandles: []syscall.Handle{syscall.Handle(parent), syscall.Handle(lease)}}
+	if err := helper.Start(); err != nil {
+		if restoreErr := restoreLightUpdate(exePath, oldPath, downloadedPath); restoreErr != nil {
+			return fmt.Errorf("start relaunch helper: %v; restore: %w", err, restoreErr)
+		}
+		return fmt.Errorf("start relaunch helper: %w", err)
+	}
+	go func() { _ = helper.Wait() }()
 
 	// Delayed exit, not immediate: Update()/runSelfUpdate still need to
 	// emit the success MsgResult back to the C2 after ApplyFn returns —
@@ -74,4 +91,37 @@ func resolveExePath() (string, error) {
 		return "", err
 	}
 	return p, nil
+}
+
+// restoreLightUpdate returns the downloaded candidate to its staging path so
+// update.Manager can remove it, preserving the enrolled agent and its identity.
+func restoreLightUpdate(exePath, previous, staged string) error {
+	if err := os.Rename(exePath, staged); err != nil {
+		return err
+	}
+	if err := os.Rename(previous, exePath); err != nil {
+		_ = os.Rename(staged, exePath)
+		return err
+	}
+	return nil
+}
+
+// An inherited exclusive file handle prevents a replacement from accepting a
+// second update while the helper still owns its startup/rollback window. The
+// file itself contains no state; a crashed helper releases the kernel lease.
+func acquireLightUpdateLease(exe string) (windows.Handle, error) {
+	path, err := windows.UTF16PtrFromString(exe + ".update-lock")
+	if err != nil {
+		return 0, err
+	}
+	h, err := windows.CreateFile(path, windows.GENERIC_READ|windows.GENERIC_WRITE,
+		0, nil, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return 0, fmt.Errorf("self-update startup or rollback already active: %w", err)
+	}
+	if err := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+		windows.CloseHandle(h)
+		return 0, fmt.Errorf("inherit self-update lease: %w", err)
+	}
+	return h, nil
 }

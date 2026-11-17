@@ -70,6 +70,9 @@ var lightTrustedSigners = map[string]struct{}{lightTrustedSigner: {}}
 var protectKeyACLFn = lightinstall.ProtectKeyACL
 
 func main() {
+	if handled, code := handleLightUpdateHelper(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "unlink":
