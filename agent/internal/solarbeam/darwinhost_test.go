@@ -45,7 +45,7 @@ const testInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>CFBundleIdentifier</key>
   <string>dev.lizardbyte.app.Sunshine</string>
   <key>CFBundleName</key>
-  <string>Vibeshine</string>
+  <string>SolarBeam</string>
   <key>CFBundleExecutable</key>
   <string>Vibeshine</string>
   <key>CFBundleShortVersionString</key>

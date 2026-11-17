@@ -1,9 +1,9 @@
 {
   "generatedFrom": "PlayerReadyPortsmouth/ReadyFleet",
-  "sourceCommit": "e7cd5abcfa97badc4a5fe5b126178df7aaa1e23f",
-  "sourceTree": "da97f1db023baf3acce9e130c030af15b45e7bba",
+  "sourceCommit": "0368b48dd31485486b04d306f79c1fe331d196be",
+  "sourceTree": "ad7ff48adb325a151483b8b4cacf41bc2af00192",
   "generator": "tools/lightagent-mirror/main.go",
   "generationCommand": "go run ./tools/lightagent-mirror -out <empty-output-directory>",
-  "releaseVersion": "0.64.2",
-  "notes": "Runtime source is copied by the source generator. Protocol is pruned to the BYOD command surface. Windows light-agent 0.64.2 source is this merged ReadyFleet revision. Linux platform source is included by the generator; the published Linux release remains 0.64.1 from its preceding SOURCE.json revision. Go build flags and artifact hashes are recorded in the release record."
+  "releaseVersion": null,
+  "notes": "Unreleased rb2 display-only branding draft, generated after the 0.64.2 light-agent and 0.64.1 installer baselines. Not the source of a published binary. Internal engine/bundle/process identity remains unchanged. Regenerate after final ReadyFleet integration."
 }

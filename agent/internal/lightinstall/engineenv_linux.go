@@ -250,8 +250,8 @@ func kwinPermissionEntry(execPath string) string {
 		"Exec=" + execPath + "\n" +
 		"X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n" +
 		"Type=Application\n" +
-		"Name=dev.lizardbyte.app.Sunshine-kwin-wayland-permission\n" +
-		"Comment=Sunshine KWin screencast permission\n" +
+		"Name=SolarBeam KWin screen permission\n" +
+		"Comment=SolarBeam KWin screencast permission\n" +
 		"NoDisplay=true\n"
 }
 

@@ -62,7 +62,7 @@ func (m *Manager) stopConfiguredEngineService() error {
 	args, err := windows.DecomposeCommandLine(cfg.BinaryPathName)
 	expected := filepath.Join(filepath.Dir(m.paths.Engine), "tools", engineServiceBinName)
 	if err != nil || len(args) != 1 || !sameConfiguredPath(args[0], expected) {
-		return errors.New("hosting off: SunshineService belongs to a different or unknown installation")
+		return errors.New("hosting off: SolarBeam service belongs to a different or unknown installation")
 	}
 	return stopServiceIfRunning(service)
 }
