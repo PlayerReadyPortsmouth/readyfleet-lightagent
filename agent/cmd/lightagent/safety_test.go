@@ -7,6 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/ownerfiles"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/update"
+	"github.com/playerreadyportsmouth/readyfleet/proto"
 )
 
 // forbiddenStrings are the tells that shell/terminal/screen-capture/
@@ -132,6 +137,33 @@ func TestLightagentBinary_ImportBoundary(t *testing.T) {
 			if strings.Contains(dep, forbidden) {
 				t.Errorf("lightagent imports forbidden package %q (via dep %q)", forbidden, dep)
 			}
+		}
+	}
+}
+
+// File handlers add only folder-scoped copies, after local owner opt-in. The
+// managed package/import bans above remain unchanged for both configurations.
+func TestLightagentOwnerFiles_OptInCommandBoundary(t *testing.T) {
+	files, err := ownerfiles.New(t.TempDir(), "owner", "controller.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files.Close()
+	manager := solarbeam.New(solarbeam.Paths{})
+	updater := update.New(update.Config{})
+	base := LightHandlers(manager, updater, fakeNotifier{}, &fakeGate{}, nil, nil, "owner")
+	optIn := LightHandlers(manager, updater, fakeNotifier{}, &fakeGate{}, nil, nil, "owner", files)
+	if len(optIn) != len(base)+3 {
+		t.Fatalf("opt-in handler count: %d", len(optIn))
+	}
+	for _, kind := range []proto.CommandKind{proto.CmdListDir, proto.CmdDownloadFile, proto.CmdUploadFile} {
+		if base[kind] != nil || optIn[kind] == nil {
+			t.Fatalf("owner opt-in boundary failed for %s", kind)
+		}
+	}
+	for _, kind := range []proto.CommandKind{"shell", "launch", "install", "restart_app", "restart_agent", "clear_cache", "re_pair", "retry_update"} {
+		if optIn[kind] != nil {
+			t.Fatalf("opt-in enabled managed command %s", kind)
 		}
 	}
 }

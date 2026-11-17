@@ -34,6 +34,15 @@ const (
 // match and pins it for the lifetime of the connection.
 const ProtocolVersion = 1
 
+// Limits enforced by both sides. Kept here so they cannot drift.
+const (
+
+	// MaxListDirEntries caps how many children one CmdListDir answer carries.
+	// A directory with more entries is truncated rather than risking a
+	// multi-megabyte JSON output chunk (ListDirResult.Truncated says so).
+	MaxListDirEntries = 5000
+)
+
 // MessageType enumerates the wire-level message kinds.
 type MessageType string
 
@@ -94,6 +103,9 @@ const (
 
 	CmdUpdate CommandKind = "update"
 
+	CmdListDir               CommandKind = "list_dir"
+	CmdDownloadFile          CommandKind = "download_file"
+	CmdUploadFile            CommandKind = "upload_file"
 	CmdSolarbeamEngineUpdate CommandKind = "solarbeam_engine_update"
 	CmdShowNotification      CommandKind = "show_notification"
 )
@@ -681,6 +693,80 @@ func (c SolarbeamHostCapabilities) Tokens() []string {
 		}
 	}
 	return out
+}
+
+// ListDirArgs is the payload for CmdListDir. An empty Path lists platform roots
+// on managed/server agents, or the locally selected exchange folder on BYOD.
+// RequesterID and DryRun are extensions for the restricted BYOD handlers only.
+type ListDirArgs struct {
+	Path string `json:"path,omitempty"`
+	// RequesterID is overwritten by the C2 from the authenticated actor.
+	RequesterID string `json:"requester_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+// DirEntry is one child of a listed directory. Size is meaningful for files
+// only (0 for directories, which are not walked to compute a total).
+type DirEntry struct {
+	Name       string    `json:"name"`
+	IsDir      bool      `json:"is_dir"`
+	Size       int64     `json:"size"`
+	ModifiedAt time.Time `json:"modified_at"`
+}
+
+// ListDirResult is emitted as a single JSON output chunk in response to
+// CmdListDir (read back via the command's collected output), mirroring
+// ScanLanResult. Path echoes the directory actually listed, already cleaned by
+// the agent, so the caller can render a breadcrumb without re-implementing the
+// target OS's path rules. Parent is empty at the root.
+// Truncated is set when the directory held more than MaxListDirEntries
+// children and Entries is a prefix of the real listing.
+type ListDirResult struct {
+	Path      string     `json:"path"`
+	Parent    string     `json:"parent,omitempty"`
+	Entries   []DirEntry `json:"entries"`
+	Truncated bool       `json:"truncated,omitempty"`
+}
+
+// DownloadFileArgs is the payload for CmdDownloadFile — machine → operator.
+// The agent reads Path and PUTs the bytes to UploadURL, a single-use,
+// short-lived ReadyApp URL. Nothing sensitive rides in the args beyond that
+// URL, and like every other artifact URL on this wire it must be
+// query-string-free (the credential is a path segment).
+type DownloadFileArgs struct {
+	Path        string `json:"path"`
+	UploadURL   string `json:"upload_url"`
+	RequesterID string `json:"requester_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+// DownloadFileResult reports a completed upload-to-ReadyApp so the operator
+// side can cross-check what actually landed. SHA256 is computed by the agent
+// over the bytes it sent.
+type DownloadFileResult struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// UploadFileArgs is the payload for CmdUploadFile — operator → machine. This
+// is CmdUpdate's flow with a caller-chosen destination: the agent GETs
+// DownloadURL, enforces the transfer size cap, verifies the bytes against
+// SHA256, and only then writes TargetPath. A hash mismatch leaves TargetPath
+// untouched.
+type UploadFileArgs struct {
+	DownloadURL string `json:"download_url"`
+	TargetPath  string `json:"target_path"`
+	SHA256      string `json:"sha256"`
+	RequesterID string `json:"requester_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+// UploadFileResult confirms what the agent wrote.
+type UploadFileResult struct {
+	TargetPath string `json:"target_path"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
 }
 
 // ViewingKind says which surface staff are watching through.

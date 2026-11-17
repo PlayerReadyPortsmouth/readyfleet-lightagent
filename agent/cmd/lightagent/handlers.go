@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinventory"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/ownerfiles"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/runtime"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/solarbeam"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/transport"
@@ -64,8 +65,8 @@ func lightInventoryProvider(agentVersion string, manager *solarbeam.Manager) fun
 // managed agent does (venuepolicy.State.StartAllowed). ownerActorID is the
 // enrolled owner (config); a C2 requester_is_owner marker is only honoured
 // when the requester matches it.
-func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier, consentGate gate, indicator *sessionIndicatorDriver, policy *venuepolicy.State, ownerActorID string) map[proto.CommandKind]runtime.Handler {
-	return map[proto.CommandKind]runtime.Handler{
+func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify notifier, consentGate gate, indicator *sessionIndicatorDriver, policy *venuepolicy.State, ownerActorID string, files ...*ownerfiles.Manager) map[proto.CommandKind]runtime.Handler {
+	handlers := map[proto.CommandKind]runtime.Handler{
 		proto.CmdInventoryRefresh: func(ctx context.Context, env proto.Envelope, send transport.SendFunc) {
 			runInventoryRefresh(ctx, env, send, manager)
 		},
@@ -88,6 +89,14 @@ func LightHandlers(manager *solarbeam.Manager, updater *update.Manager, notify n
 			runShowNotification(ctx, env, send, notify, consentGate, indicator)
 		},
 	}
+	// The optional handlers exist only after a locally selected folder opened.
+	// Every call independently checks the C2-attributed enrolled owner.
+	if len(files) == 1 && files[0] != nil {
+		handlers[proto.CmdListDir] = files[0].RunListDir
+		handlers[proto.CmdDownloadFile] = files[0].RunDownloadFile
+		handlers[proto.CmdUploadFile] = files[0].RunUploadFile
+	}
+	return handlers
 }
 
 func runInventoryRefresh(ctx context.Context, cmdEnv proto.Envelope, send transport.SendFunc, manager *solarbeam.Manager) {

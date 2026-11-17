@@ -85,6 +85,11 @@ type Config struct {
 	// the local-operator posture warm_engine already has.
 	OwnerActorID string `json:"owner_actor_id,omitempty"`
 
+	// OwnerFileRoot is an existing folder selected locally by the BYOD owner.
+	// Empty disables file exchange. Commands cannot change it; copy is bounded
+	// to this folder and never overwrites an existing file.
+	OwnerFileRoot string `json:"owner_file_root,omitempty"`
+
 	// WarmEngine is the per-machine kill switch for the managed agent's
 	// warm-engine behaviour: preloading the SolarBeam engine at agent
 	// start, skipping the per-session engine restart when the engine is
