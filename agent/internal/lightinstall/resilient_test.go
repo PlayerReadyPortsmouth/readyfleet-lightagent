@@ -255,3 +255,49 @@ func TestRollbackRestoresStartupSnapshotAndProtectsOldKey(t *testing.T) {
 		t.Fatalf("startup restored=%v protect calls=%d", restored, protected)
 	}
 }
+
+func TestRepairReusesControllerAdvertisedProductionAlias(t *testing.T) {
+	m := resilientManager(t)
+	m.cfg.ServerURL = "wss://fleet.player-ready.co.uk:8643/agent/v1"
+	validIdentity(t, m)
+	c, err := config.Load(m.cfg.Paths.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.ServerURL = "wss://readyapp.player-ready.co.uk:8643/agent/v1"
+	if err := config.Save(m.cfg.Paths.ConfigPath, c); err != nil {
+		t.Fatal(err)
+	}
+	m.enrollFn = func(context.Context, Config, Payload, func()) error {
+		t.Fatal("redeemed spent token instead of repairing existing identity")
+		return nil
+	}
+	if err := m.Install(context.Background(), Payload{ResilientInstall: true, ExpectedOwnerActorID: "owner", EnrollmentToken: "already_spent"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepairRejectsDifferentControllerEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"wss://other.example:8643/agent/v1", "wss://readyapp.player-ready.co.uk:9999/agent/v1", "ws://readyapp.player-ready.co.uk:8643/agent/v1", "wss://readyapp.player-ready.co.uk:8643/other"} {
+		t.Run(endpoint, func(t *testing.T) {
+			m := resilientManager(t)
+			m.cfg.ServerURL = "wss://fleet.player-ready.co.uk:8643/agent/v1"
+			validIdentity(t, m)
+			c, _ := config.Load(m.cfg.Paths.ConfigPath)
+			c.ServerURL = endpoint
+			if err := config.Save(m.cfg.Paths.ConfigPath, c); err != nil {
+				t.Fatal(err)
+			}
+			if reusableIdentity(m.cfg) {
+				t.Fatal("accepted a different controller endpoint")
+			}
+		})
+	}
+}
+
+func TestEnrollmentFailureInstructionIsPlainEnglish(t *testing.T) {
+	text := (&Failure{Step: "enroll", Code: "enroll_failed", Cause: errors.New("401")}).Instruction()
+	if strings.Contains(text, "enroll_failed") || !strings.Contains(text, "fresh") || !strings.Contains(text, "already been used") {
+		t.Fatal(text)
+	}
+}

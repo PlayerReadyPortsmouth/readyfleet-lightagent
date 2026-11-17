@@ -123,3 +123,9 @@ func TestRedactUsernamesInsideSecretsCannotSplitCredentials(t *testing.T) {
 		t.Fatalf("plain username was not redacted: %q", out)
 	}
 }
+
+func TestFailureReportUsesPublicAPIRoute(t *testing.T) {
+	if reportEndpoint != "https://readyapp.player-ready.co.uk/api/solarbeam-devices/install-failure" {
+		t.Fatalf("report endpoint misses public API router: %s", reportEndpoint)
+	}
+}

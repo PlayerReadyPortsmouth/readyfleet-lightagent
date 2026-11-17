@@ -39,7 +39,7 @@ func (f *Failure) Instruction() string {
 		"preflight":   "Check the PC clock, free disk space and your internet connection. Allow ReadyFleet through your proxy or firewall, then try again.",
 		"stage":       "Close ReadyFleet and try again. Check Windows Security Protection History for a blocked file; ask support to check the signature before allowing it.",
 		"verify":      "Download a fresh setup file from ReadyApp. If Windows Security blocked it, ask support to check its signature. Do not switch off protection.",
-		"enroll":      "Open ReadyApp and download a fresh setup link: the previous code may have expired or already been used. Confirm the device when ReadyApp asks.",
+		"enroll":      "This setup file could not enrol the device. Its code may have expired or already been used. Open ReadyApp, download a fresh setup file and confirm the device when asked.",
 		"credentials": "Check that your account can write to its own app-data folder, then download a fresh setup link.",
 		"startup":     "Check your account's startup-app policy with support, then run setup again.",
 		"start":       "Check Windows Security Protection History or your Linux user service, then run setup again.",
@@ -53,12 +53,12 @@ func (f *Failure) Instruction() string {
 	}
 	instruction := next[f.Step]
 	if instruction == "" {
-		instruction = "Run setup again, or contact support with the step and error code below."
+		instruction = "Run setup again. If it still fails, contact support."
 	}
 	if f.Rollback != nil {
 		instruction += " Cleanup could not finish. Contact support before trying again."
 	}
-	return "Setup stopped at " + f.Step + " (" + f.Code + "). " + instruction
+	return instruction
 }
 
 type savedFile struct {
@@ -124,6 +124,31 @@ func atomicFile(path string, data []byte, mode os.FileMode) error {
 }
 func stageAgent(path string, data []byte) error { return atomicFile(path, data, 0755) }
 
+func sameController(expectedURL, actualURL string) bool {
+	expected, err := url.Parse(expectedURL)
+	if err != nil {
+		return false
+	}
+	actual, err := url.Parse(actualURL)
+	if err != nil {
+		return false
+	}
+	// C2 advertises the ReadyApp hostname after enrolment; released setup
+	// binaries use the fleet hostname for the same production listener.
+	canonicalHost := func(u *url.URL) string {
+		host := strings.ToLower(u.Host)
+		if host == "readyapp.player-ready.co.uk:8643" {
+			return "fleet.player-ready.co.uk:8643"
+		}
+		return host
+	}
+	return expected.Scheme == "wss" && actual.Scheme == expected.Scheme &&
+		expected.User == nil && actual.User == nil && expected.Host != "" &&
+		canonicalHost(expected) == canonicalHost(actual) &&
+		expected.EscapedPath() == actual.EscapedPath() &&
+		expected.RawQuery == actual.RawQuery && expected.Fragment == actual.Fragment
+}
+
 // Reuse only a complete identity for this controller. The certificate/key must
 // match, remain valid and chain to its enrolled CA. An arbitrary config file is
 // not evidence that a token can safely be skipped.
@@ -132,9 +157,7 @@ func reusableIdentity(cfg Config) bool {
 	if err != nil || c.MachineID == "" || c.EnrollmentSecret != "" {
 		return false
 	}
-	expected, _ := url.Parse(cfg.ServerURL)
-	actual, _ := url.Parse(c.ServerURL)
-	if expected == nil || actual == nil || !strings.EqualFold(expected.Hostname(), actual.Hostname()) {
+	if !sameController(cfg.ServerURL, c.ServerURL) {
 		return false
 	}
 	if filepath.Clean(c.KeyPath) != filepath.Clean(cfg.Paths.KeyPath) || filepath.Clean(c.CertPath) != filepath.Join(cfg.Paths.Root, "client.crt") || filepath.Clean(c.CAPath) != filepath.Join(cfg.Paths.Root, "ca.crt") {

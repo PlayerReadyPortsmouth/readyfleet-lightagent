@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const reportEndpoint = "https://readyapp.player-ready.co.uk/solarbeam-devices/install-failure"
+const reportEndpoint = "https://readyapp.player-ready.co.uk/api/solarbeam-devices/install-failure"
 
 var reportVersion = "dev"
 
