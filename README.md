@@ -5,9 +5,30 @@ agent and installer. Regenerate it from ReadyFleet; do not hand-edit runtime
 files in this mirror. The current source can be newer than a published release.
 
 The controller commands are listed in [CONTRACT.md](CONTRACT.md). Managed venue
-commands are removed from the protocol: 168 declarations kept, 426 omitted.
+commands are removed from the protocol: 179 declarations kept, 419 omitted.
 The agent reports only its OS, architecture, its own version and SolarBeam host
 readiness. The full venue hardware/software inventory collector is excluded.
+
+## Optional owner file copy
+
+File copy is disabled by default. The device owner may opt in locally by
+setting "owner_file_root" in their agent config.json to an existing absolute
+folder they choose (for example C:\Users\you\Documents\ReadyFleetExchange
+on Windows or /home/you/ReadyFleetExchange on Linux), then restarting the agent.
+Choose a dedicated exchange folder. The controller cannot select or widen it.
+Clear the setting and restart to disable copying. Folder contents are shared
+only with the enrolled owner authenticated by ReadyApp, checked independently
+by C2 and this agent; being an administrator or session driver grants no access.
+
+Only list_dir, download_file and upload_file are added by that local opt-in.
+They read regular files and create new files inside the selected folder, never
+overwrite existing files, create directories, follow paths outside it, or run
+files. Hidden paths and executable/startup file types are refused on writes.
+Copies are limited to one file, 8 MiB, two minutes, and ten operations/minute.
+The controller adds its own owner and rate checks and records audit receipts.
+Transfers use HTTPS to the controller host, disallow redirects, and check SHA256.
+A dry_run checks the selected path without fetching or writing inbound bytes;
+read dry-runs hash the source without sending it. No background retry or replay.
 
 Build and run the checks from this workspace:
 

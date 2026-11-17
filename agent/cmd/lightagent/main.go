@@ -8,12 +8,14 @@
 // Hard import boundary (enforced by TestLightagentBinary_ContainsNoForbiddenStrings
 // in safety_test.go, not just this package list): this package imports
 // runtime, transport, enroll, config, lightinventory, lightinstall,
-// solarbeam, update, and hiddenbrowser — never the managed agent/internal/exec,
+// solarbeam, update, ownerfiles, and hiddenbrowser — never the managed agent/internal/exec,
 // screen, terminal, service, inventory, or LAN-scan packages. It never
 // registers a handler for shell, terminal, screen, lifecycle, launch,
 // boot, unattended, discovery, wake, push-install, or generic install.
 // hiddenbrowser introduces no new command kind — it's triggered purely
 // locally from the tray menu, never over the wire.
+// ownerfiles adds three file-copy handlers only after the owner selects an
+// existing local folder; ownership and rooted-path checks apply on every call.
 //
 // Runs as a current-user process launched from an HKCU Run key at logon,
 // NOT a Windows service — svcpkg.IsWindowsService()/Run() are hard-wired
@@ -36,6 +38,7 @@ import (
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/enroll"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinstall"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/lightinventory"
+	"github.com/playerreadyportsmouth/readyfleet/agent/internal/ownerfiles"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/runtime"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/sacposture"
 	"github.com/playerreadyportsmouth/readyfleet/agent/internal/sessionindicator"
@@ -289,6 +292,11 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 	// The C2's venue policy for the current connection, reset on every
 	// reconnect and set from the authenticated hello_ack.
 	var remotePolicy venuepolicy.State
+	files, err := ownerfiles.New(cfg.OwnerFileRoot, cfg.OwnerActorID, agentDownloadHost(cfg.ServerURL))
+	if err != nil {
+		logger.Warn("owner file exchange disabled", "err", err)
+	}
+	defer files.Close()
 	client := runtime.NewClient(runtime.Config{
 		ServerURL:             cfg.ServerURL,
 		CertFile:              cfg.CertPath,
@@ -311,6 +319,7 @@ func runLightAgent(ctx context.Context, configPath string, insecure bool, logger
 			indicator,
 			&remotePolicy,
 			cfg.OwnerActorID,
+			files,
 		),
 	})
 
