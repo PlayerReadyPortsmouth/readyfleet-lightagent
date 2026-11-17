@@ -251,7 +251,7 @@ type Config struct {
 	SolarbeamDir string `json:"solarbeam_dir,omitempty"`
 
 	// SolarbeamEngineApp (macOS) is the engine .app bundle. Absent ⇒
-	// <SolarbeamDir>/Vibeshine.app. The executable run is
+	// <SolarbeamDir>/Vibeshine.app (display name SolarBeam). The executable run is
 	// Contents/MacOS/<CFBundleExecutable> from its Info.plist.
 	SolarbeamEngineApp string `json:"solarbeam_engine_app,omitempty"`
 
